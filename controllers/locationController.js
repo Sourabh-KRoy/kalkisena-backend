@@ -1,6 +1,11 @@
 const { Ride, Vehicle } = require('../models');
 const { validationResult } = require('express-validator');
-const { emitDriverLocationToUser, emitUserLocationToDriver } = require('../utils/socketService');
+const {
+  emitDriverLocationToUser,
+  emitUserLocationToDriver,
+  setDriverLocationForRide,
+  getDriverLocationForRide,
+} = require('../utils/socketService');
 const { Op } = require('sequelize');
 
 /**
@@ -79,6 +84,12 @@ const shareDriverLocation = async (req, res) => {
     }
 
     // Emit location to user via WebSocket
+    const cachedLocation = setDriverLocationForRide(
+      ride_id,
+      latitude,
+      longitude,
+      driverId,
+    );
     emitDriverLocationToUser(ride.user_id, ride_id, latitude, longitude);
 
     res.json({
@@ -86,9 +97,9 @@ const shareDriverLocation = async (req, res) => {
       message: 'Location shared successfully',
       data: {
         ride_id: ride_id,
-        latitude: parseFloat(latitude),
-        longitude: parseFloat(longitude),
-        timestamp: new Date().toISOString()
+        latitude: cachedLocation.latitude,
+        longitude: cachedLocation.longitude,
+        timestamp: cachedLocation.timestamp
       }
     });
   } catch (error) {
@@ -217,6 +228,14 @@ const getDriverLocation = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Driver location is only available for accepted or in-progress rides'
+      });
+    }
+
+    const cachedLocation = getDriverLocationForRide(ride_id);
+    if (cachedLocation) {
+      return res.json({
+        success: true,
+        data: cachedLocation
       });
     }
 
