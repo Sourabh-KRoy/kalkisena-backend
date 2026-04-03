@@ -1,12 +1,12 @@
-const { Ride, Vehicle } = require('../models');
-const { validationResult } = require('express-validator');
+const { Ride, Vehicle } = require("../models");
+const { validationResult } = require("express-validator");
 const {
   emitDriverLocationToUser,
   emitUserLocationToDriver,
   setDriverLocationForRide,
   getDriverLocationForRide,
-} = require('../utils/socketService');
-const { Op } = require('sequelize');
+} = require("../utils/socketService");
+const { Op } = require("sequelize");
 
 /**
  * Share driver location during active ride
@@ -17,18 +17,18 @@ const shareDriverLocation = async (req, res) => {
     if (!errors.isEmpty()) {
       return res.status(400).json({
         success: false,
-        message: 'Validation failed',
-        errors: errors.array()
+        message: "Validation failed",
+        errors: errors.array(),
       });
     }
 
     const driverId = req.user.id;
     const { ride_id, latitude, longitude } = req.body;
 
-    if (req.user.users_type !== 'driver') {
+    if (req.user.users_type !== "driver") {
       return res.status(403).json({
         success: false,
-        message: 'Only drivers can share location'
+        message: "Only drivers can share location",
       });
     }
 
@@ -36,14 +36,14 @@ const shareDriverLocation = async (req, res) => {
     if (isNaN(latitude) || latitude < -90 || latitude > 90) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid latitude'
+        message: "Invalid latitude",
       });
     }
 
     if (isNaN(longitude) || longitude < -180 || longitude > 180) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid longitude'
+        message: "Invalid longitude",
       });
     }
 
@@ -52,21 +52,21 @@ const shareDriverLocation = async (req, res) => {
     if (!ride) {
       return res.status(404).json({
         success: false,
-        message: 'Ride not found'
+        message: "Ride not found",
       });
     }
 
     if (ride.driver_id !== driverId) {
       return res.status(403).json({
         success: false,
-        message: 'You are not authorized to share location for this ride'
+        message: "You are not authorized to share location for this ride",
       });
     }
 
-    if (!['accepted', 'in_progress'].includes(ride.status)) {
+    if (!["accepted", "in_progress"].includes(ride.status)) {
       return res.status(400).json({
         success: false,
-        message: 'Can only share location for accepted or in-progress rides'
+        message: "Can only share location for accepted or in-progress rides",
       });
     }
 
@@ -75,11 +75,11 @@ const shareDriverLocation = async (req, res) => {
       await Vehicle.update(
         {
           current_latitude: parseFloat(latitude),
-          current_longitude: parseFloat(longitude)
+          current_longitude: parseFloat(longitude),
         },
         {
-          where: { id: ride.vehicle_id }
-        }
+          where: { id: ride.vehicle_id },
+        },
       );
     }
 
@@ -94,20 +94,20 @@ const shareDriverLocation = async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Location shared successfully',
+      message: "Location shared successfully",
       data: {
         ride_id: ride_id,
         latitude: cachedLocation.latitude,
         longitude: cachedLocation.longitude,
-        timestamp: cachedLocation.timestamp
-      }
+        timestamp: cachedLocation.timestamp,
+      },
     });
   } catch (error) {
-    console.error('Share driver location error:', error);
+    console.error("Share driver location error:", error);
     res.status(500).json({
       success: false,
-      message: 'Error sharing location',
-      error: error.message
+      message: "Error sharing location",
+      error: error.message,
     });
   }
 };
@@ -121,8 +121,8 @@ const shareUserLocation = async (req, res) => {
     if (!errors.isEmpty()) {
       return res.status(400).json({
         success: false,
-        message: 'Validation failed',
-        errors: errors.array()
+        message: "Validation failed",
+        errors: errors.array(),
       });
     }
 
@@ -133,14 +133,14 @@ const shareUserLocation = async (req, res) => {
     if (isNaN(latitude) || latitude < -90 || latitude > 90) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid latitude'
+        message: "Invalid latitude",
       });
     }
 
     if (isNaN(longitude) || longitude < -180 || longitude > 180) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid longitude'
+        message: "Invalid longitude",
       });
     }
 
@@ -149,21 +149,21 @@ const shareUserLocation = async (req, res) => {
     if (!ride) {
       return res.status(404).json({
         success: false,
-        message: 'Ride not found'
+        message: "Ride not found",
       });
     }
 
     if (ride.user_id !== userId) {
       return res.status(403).json({
         success: false,
-        message: 'You are not authorized to share location for this ride'
+        message: "You are not authorized to share location for this ride",
       });
     }
 
-    if (!['accepted', 'in_progress'].includes(ride.status)) {
+    if (!["accepted", "in_progress"].includes(ride.status)) {
       return res.status(400).json({
         success: false,
-        message: 'Can only share location for accepted or in-progress rides'
+        message: "Can only share location for accepted or in-progress rides",
       });
     }
 
@@ -174,20 +174,20 @@ const shareUserLocation = async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Location shared successfully',
+      message: "Location shared successfully",
       data: {
         ride_id: ride_id,
         latitude: parseFloat(latitude),
         longitude: parseFloat(longitude),
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
-    console.error('Share user location error:', error);
+    console.error("Share user location error:", error);
     res.status(500).json({
       success: false,
-      message: 'Error sharing location',
-      error: error.message
+      message: "Error sharing location",
+      error: error.message,
     });
   }
 };
@@ -204,30 +204,31 @@ const getDriverLocation = async (req, res) => {
       include: [
         {
           model: Vehicle,
-          as: 'vehicle',
-          attributes: ['id', 'current_latitude', 'current_longitude']
-        }
-      ]
+          as: "vehicle",
+          attributes: ["id", "current_latitude", "current_longitude"],
+        },
+      ],
     });
 
     if (!ride) {
       return res.status(404).json({
         success: false,
-        message: 'Ride not found'
+        message: "Ride not found",
       });
     }
 
     if (ride.user_id !== userId) {
       return res.status(403).json({
         success: false,
-        message: 'You are not authorized to view location for this ride'
+        message: "You are not authorized to view location for this ride",
       });
     }
 
-    if (!['accepted', 'in_progress'].includes(ride.status)) {
+    if (!["accepted", "in_progress"].includes(ride.status)) {
       return res.status(400).json({
         success: false,
-        message: 'Driver location is only available for accepted or in-progress rides'
+        message:
+          "Driver location is only available for accepted or in-progress rides",
       });
     }
 
@@ -235,14 +236,18 @@ const getDriverLocation = async (req, res) => {
     if (cachedLocation) {
       return res.json({
         success: true,
-        data: cachedLocation
+        data: cachedLocation,
       });
     }
 
-    if (!ride.vehicle || !ride.vehicle.current_latitude || !ride.vehicle.current_longitude) {
+    if (
+      !ride.vehicle ||
+      !ride.vehicle.current_latitude ||
+      !ride.vehicle.current_longitude
+    ) {
       return res.status(404).json({
         success: false,
-        message: 'Driver location not available'
+        message: "Driver location not available",
       });
     }
 
@@ -252,15 +257,15 @@ const getDriverLocation = async (req, res) => {
         ride_id: ride_id,
         latitude: parseFloat(ride.vehicle.current_latitude),
         longitude: parseFloat(ride.vehicle.current_longitude),
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     });
   } catch (error) {
-    console.error('Get driver location error:', error);
+    console.error("Get driver location error:", error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching driver location',
-      error: error.message
+      message: "Error fetching driver location",
+      error: error.message,
     });
   }
 };
@@ -268,5 +273,5 @@ const getDriverLocation = async (req, res) => {
 module.exports = {
   shareDriverLocation,
   shareUserLocation,
-  getDriverLocation
+  getDriverLocation,
 };
