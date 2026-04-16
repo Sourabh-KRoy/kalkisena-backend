@@ -17,6 +17,34 @@ const { generateOTP } = require("../utils/helpers");
 const { Op } = require("sequelize");
 const { all } = require("axios");
 
+const restoreDriverAvailabilityIfIdle = async (driverId) => {
+  if (!driverId) {
+    return;
+  }
+
+  const activeRide = await Ride.findOne({
+    where: {
+      driver_id: driverId,
+      status: {
+        [Op.in]: ["accepted", "in_progress"],
+      },
+    },
+  });
+
+  if (!activeRide) {
+    await User.update(
+      { driver_available_for_rides: true },
+      {
+        where: {
+          id: driverId,
+          users_type: "driver",
+          driver_mode: "online",
+        },
+      },
+    );
+  }
+};
+
 const attachDriverLocationToRide = (rideRecord) => {
   const rideData = rideRecord?.toJSON ? rideRecord.toJSON() : rideRecord;
 
@@ -30,6 +58,120 @@ const attachDriverLocationToRide = (rideRecord) => {
   }
 
   return rideData;
+};
+
+/**
+ * Driver goes online/offline. While online, latitude and longitude are stored on the user row.
+ */
+const setDriverStatus = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
+    }
+
+    if (req.user.users_type !== "driver") {
+      return res.status(403).json({
+        success: false,
+        message: "Only drivers can update online/offline status",
+      });
+    }
+
+    const driverId = req.user.id;
+    const { mode, latitude, longitude } = req.body;
+
+    if (!["online", "offline"].includes(mode)) {
+      return res.status(400).json({
+        success: false,
+        message: "mode must be online or offline",
+      });
+    }
+
+    const driverUser = await User.findByPk(driverId);
+    if (!driverUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (mode === "online") {
+      if (latitude == null || longitude == null) {
+        return res.status(400).json({
+          success: false,
+          message: "latitude and longitude are required when going online",
+        });
+      }
+
+      const lat = parseFloat(latitude);
+      const lng = parseFloat(longitude);
+      if (Number.isNaN(lat) || lat < -90 || lat > 90) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid latitude. Must be between -90 and 90",
+        });
+      }
+      if (Number.isNaN(lng) || lng < -180 || lng > 180) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid longitude. Must be between -180 and 180",
+        });
+      }
+
+      const activeRide = await Ride.findOne({
+        where: {
+          driver_id: driverId,
+          status: {
+            [Op.in]: ["accepted", "in_progress"],
+          },
+        },
+      });
+
+      driverUser.driver_mode = "online";
+      driverUser.driver_available_for_rides = !activeRide;
+      driverUser.current_latitude = lat;
+      driverUser.current_longitude = lng;
+      driverUser.driver_location_updated_at = new Date();
+      await driverUser.save();
+    } else {
+      driverUser.driver_mode = "offline";
+      driverUser.driver_available_for_rides = false;
+      await driverUser.save();
+    }
+
+    const payload = driverUser.toJSON ? driverUser.toJSON() : driverUser;
+
+    res.json({
+      success: true,
+      message:
+        mode === "online"
+          ? "You are online and can receive ride requests"
+          : "You are offline",
+      data: {
+        driver_mode: payload.driver_mode,
+        driver_available_for_rides: payload.driver_available_for_rides,
+        current_location:
+          payload.current_latitude != null && payload.current_longitude != null
+            ? {
+                latitude: parseFloat(payload.current_latitude),
+                longitude: parseFloat(payload.current_longitude),
+              }
+            : null,
+        driver_location_updated_at: payload.driver_location_updated_at || null,
+      },
+    });
+  } catch (error) {
+    console.error("Set driver status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating driver status",
+      error: error.message,
+    });
+  }
 };
 
 const bookRide = async (req, res) => {
@@ -109,6 +251,30 @@ const bookRide = async (req, res) => {
       ride_otp: rideOtp,
       status: "pending",
     });
+
+    setTimeout(async () => {
+      try {
+        const pendingRide = await Ride.findByPk(ride.id);
+
+        if (pendingRide && pendingRide.status === "pending") {
+          pendingRide.status = "cancelled";
+          pendingRide.cancelled_at = new Date();
+          pendingRide.cancellation_reason = "No driver accepted";
+
+          await pendingRide.save();
+
+          console.log(`Ride ${ride.id} auto-cancelled`);
+
+          emitRideUpdateToUser(pendingRide.user_id, {
+            ...pendingRide.toJSON(),
+            status: "cancelled",
+            message: "No driver accepted your ride",
+          });
+        }
+      } catch (err) {
+        console.error("Auto cancel error:", err);
+      }
+    }, 60 * 1500);
 
     const rideWithUser = await Ride.findByPk(ride.id, {
       include: [
@@ -216,37 +382,79 @@ const bookRide = async (req, res) => {
         .filter(Boolean)
         .map((id) => String(id));
 
-      const onlineDriverIds = getOnlineDriverIds(driverIds);
-      const offlineMatchingDriverIds = driverIds.filter(
-        (id) => !onlineDriverIds.includes(id),
+      const numericDriverIds = [
+        ...new Set(
+          driverIds
+            .map((id) => parseInt(id, 10))
+            .filter((n) => !Number.isNaN(n)),
+        ),
+      ];
+
+      const eligibleDriverRows =
+        numericDriverIds.length > 0
+          ? await User.findAll({
+              where: {
+                id: { [Op.in]: numericDriverIds },
+                users_type: "driver",
+                is_active: true,
+                driver_mode: "online",
+                driver_available_for_rides: true,
+              },
+              attributes: ["id"],
+            })
+          : [];
+
+      const eligibleDriverIdStrings = eligibleDriverRows.map((u) =>
+        String(u.id),
+      );
+
+      const socketOnlineEligible = getOnlineDriverIds(eligibleDriverIdStrings);
+      const notEligibleForJob = driverIds.filter(
+        (id) => !eligibleDriverIdStrings.includes(id),
+      );
+      const eligibleButSocketOffline = eligibleDriverIdStrings.filter(
+        (id) => !socketOnlineEligible.includes(id),
       );
 
       console.log(
         `Ride ${ride.id} filter => vehicle_type:${vehicle_type}, car_variety:${car_variety || "none"}`,
       );
       console.log(
-        `Ride ${ride.id} matching driver IDs: ${driverIds.join(", ") || "none"}`,
+        `Ride ${ride.id} matching driver IDs (registration): ${driverIds.join(", ") || "none"}`,
       );
-      console.log(`Total online drivers: ${getOnlineDriverCount()}`);
-      console.log(`Matching active drivers: ${driverIds.length}`);
-      console.log(`Matching online drivers: ${onlineDriverIds.length}`);
-      if (offlineMatchingDriverIds.length > 0) {
+      console.log(
+        `Ride ${ride.id} online+available driver IDs (DB): ${eligibleDriverIdStrings.join(", ") || "none"}`,
+      );
+      console.log(`Total socket-connected drivers: ${getOnlineDriverCount()}`);
+      console.log(`Matching registration drivers: ${driverIds.length}`);
+      console.log(
+        `Matching online+available (DB): ${eligibleDriverIdStrings.length}`,
+      );
+      console.log(
+        `Matching socket+online+available: ${socketOnlineEligible.length}`,
+      );
+      if (notEligibleForJob.length > 0) {
         console.log(
-          `Ride ${ride.id} matching but offline driver IDs: ${offlineMatchingDriverIds.join(", ")}`,
+          `Ride ${ride.id} skipped (offline / busy / unavailable): ${notEligibleForJob.join(", ")}`,
+        );
+      }
+      if (eligibleButSocketOffline.length > 0) {
+        console.log(
+          `Ride ${ride.id} online in DB but no socket — cannot push: ${eligibleButSocketOffline.join(", ")}`,
         );
       }
 
-      if (onlineDriverIds.length > 0) {
+      if (socketOnlineEligible.length > 0) {
         console.log(
-          `Ride ${ride.id} sending booking to driver IDs: ${onlineDriverIds.join(", ")}`,
+          `Ride ${ride.id} sending booking to driver IDs: ${socketOnlineEligible.join(", ")}`,
         );
-        emitRideRequestToDrivers(onlineDriverIds, rideRequestData);
+        emitRideRequestToDrivers(socketOnlineEligible, rideRequestData);
         console.log(
-          `Ride ${ride.id} request sent to ${onlineDriverIds.length} active connected drivers`,
+          `Ride ${ride.id} request sent to ${socketOnlineEligible.length} connected online+available drivers`,
         );
       } else {
         console.log(
-          `Ride ${ride.id} no active connected drivers found for this vehicle type`,
+          `Ride ${ride.id} no connected drivers that are online and available for this vehicle type`,
         );
       }
     } catch (socketError) {
@@ -293,6 +501,49 @@ const getAvailableRides = async (req, res) => {
         success: false,
         message:
           "Driver registration not found. Please complete your driver registration first.",
+      });
+    }
+
+    const driverUser = await User.findByPk(driverId, {
+      attributes: [
+        "id",
+        "driver_mode",
+        "driver_available_for_rides",
+        "current_latitude",
+        "current_longitude",
+        "driver_location_updated_at",
+      ],
+    });
+
+    if (!driverUser || driverUser.driver_mode !== "online") {
+      return res.json({
+        success: true,
+        data: {
+          rides: [],
+          driver_mode: driverUser?.driver_mode || "offline",
+          driver_available_for_rides:
+            driverUser?.driver_available_for_rides ?? false,
+          current_location:
+            driverUser?.current_latitude != null &&
+            driverUser?.current_longitude != null
+              ? {
+                  latitude: parseFloat(driverUser.current_latitude),
+                  longitude: parseFloat(driverUser.current_longitude),
+                }
+              : null,
+          driver_location_updated_at:
+            driverUser?.driver_location_updated_at || null,
+          driver_vehicle: null,
+          driver_registration_vehicle_type: driverRegistration.vehicle_type,
+          driver_registration: {
+            user_id: driverRegistration.user_id,
+            status: driverRegistration.status,
+            vehicle_type: driverRegistration.vehicle_type,
+            city_to_ride: driverRegistration.city_to_ride,
+          },
+          total_rides: 0,
+          hint: "Go online to see and accept ride requests",
+        },
       });
     }
 
@@ -351,6 +602,18 @@ const getAvailableRides = async (req, res) => {
       success: true,
       data: {
         rides: allRides,
+        driver_mode: driverUser.driver_mode,
+        driver_available_for_rides: driverUser.driver_available_for_rides,
+        current_location:
+          driverUser.current_latitude != null &&
+          driverUser.current_longitude != null
+            ? {
+                latitude: parseFloat(driverUser.current_latitude),
+                longitude: parseFloat(driverUser.current_longitude),
+              }
+            : null,
+        driver_location_updated_at:
+          driverUser.driver_location_updated_at || null,
         driver_vehicle: driverVehicle
           ? {
               id: driverVehicle.id,
@@ -405,6 +668,30 @@ const acceptRide = async (req, res) => {
       return res.status(403).json({
         success: false,
         message: "Only drivers can accept rides",
+      });
+    }
+
+    const driverUser = await User.findByPk(driverId, {
+      attributes: [
+        "id",
+        "users_type",
+        "driver_mode",
+        "driver_available_for_rides",
+      ],
+    });
+
+    if (!driverUser || driverUser.driver_mode !== "online") {
+      return res.status(400).json({
+        success: false,
+        message: "You must be online to accept ride requests",
+      });
+    }
+
+    if (!driverUser.driver_available_for_rides) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "You are not available for new rides. Finish or cancel your current ride first.",
       });
     }
 
@@ -497,6 +784,9 @@ const acceptRide = async (req, res) => {
     // ride.vehicle_id = driverVehicle.id;
     ride.status = "accepted";
     await ride.save();
+
+    driverUser.driver_available_for_rides = false;
+    await driverUser.save();
 
     // driverVehicle.is_available = false;
     // await driverVehicle.save();
@@ -874,6 +1164,8 @@ const completeRide = async (req, res) => {
       await ride.vehicle.save();
     }
 
+    await restoreDriverAvailabilityIfIdle(driverId);
+
     const updatedRide = await Ride.findByPk(ride.id, {
       include: [
         {
@@ -981,6 +1273,10 @@ const cancelRide = async (req, res) => {
 
     await ride.save();
 
+    const driverIdToRelease = ride.driver_id;
+
+    await restoreDriverAvailabilityIfIdle(driverIdToRelease);
+
     const updatedRide = await Ride.findByPk(ride.id, {
       include: [
         {
@@ -1071,7 +1367,9 @@ const getUserRides = async (req, res) => {
       offset: parseInt(offset),
     });
 
-    const ridesData = rides.rows.map((ride) => attachDriverLocationToRide(ride));
+    const ridesData = rides.rows.map((ride) =>
+      attachDriverLocationToRide(ride),
+    );
 
     res.json({
       success: true,
@@ -1460,6 +1758,27 @@ const updateDriverLocation = async (req, res) => {
       });
     }
 
+    const driverUser = await User.findByPk(driverId, {
+      attributes: ["id", "driver_mode"],
+    });
+
+    if (!driverUser || driverUser.driver_mode !== "online") {
+      return res.status(400).json({
+        success: false,
+        message: "Go online before sharing your location",
+      });
+    }
+
+    const now = new Date();
+    await User.update(
+      {
+        current_latitude: parseFloat(latitude),
+        current_longitude: parseFloat(longitude),
+        driver_location_updated_at: now,
+      },
+      { where: { id: driverId, users_type: "driver" } },
+    );
+
     // Commented out as requested: do not use vehicle table
     // let vehicle;
     // if (vehicle_id) {
@@ -1515,11 +1834,12 @@ const updateDriverLocation = async (req, res) => {
 
     res.json({
       success: true,
-      message: "Driver location received (vehicle table update is disabled)",
+      message: "Driver location updated",
       data: {
         vehicle_id: vehicle_id || null,
         latitude: parseFloat(latitude),
         longitude: parseFloat(longitude),
+        driver_location_updated_at: now.toISOString(),
       },
     });
   } catch (error) {
@@ -1534,6 +1854,7 @@ const updateDriverLocation = async (req, res) => {
 
 module.exports = {
   bookRide,
+  setDriverStatus,
   getAvailableRides,
   acceptRide,
   startRide,

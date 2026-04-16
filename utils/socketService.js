@@ -1,6 +1,17 @@
 let io = null;
+/** @type {Map<string, Set<string>>} driverId -> set of socket ids (multiple tabs / devices per driver) */
 const driverConnections = new Map();
 const rideDriverLocations = new Map();
+
+const removeDriverSocket = (driverId, socketId) => {
+  if (!driverId || !socketId) return;
+  const set = driverConnections.get(String(driverId));
+  if (!set) return;
+  set.delete(socketId);
+  if (set.size === 0) {
+    driverConnections.delete(String(driverId));
+  }
+};
 
 const driverRoom = (driverId) => `driver:${String(driverId)}`;
 const userRoom = (userId) => `user:${String(userId)}`;
@@ -51,9 +62,21 @@ const initializeSocket = (server) => {
     socket.on("driver:connect", (data) => {
       if (data && data.driverId) {
         const driverId = String(data.driverId);
-        driverConnections.set(driverId, socket.id);
+        const prevDriverId = socket.data?.driverId;
+        if (prevDriverId && prevDriverId !== driverId) {
+          removeDriverSocket(prevDriverId, socket.id);
+        }
+        socket.data.driverId = driverId;
         socket.join(driverRoom(driverId));
-        console.log(`Driver ${driverId} connected with socket ${socket.id}`);
+        let set = driverConnections.get(driverId);
+        if (!set) {
+          set = new Set();
+          driverConnections.set(driverId, set);
+        }
+        set.add(socket.id);
+        console.log(
+          `Driver ${driverId} connected with socket ${socket.id} (open tabs/sockets: ${set.size})`,
+        );
       }
     });
 
@@ -142,12 +165,21 @@ const initializeSocket = (server) => {
 
     // Driver disconnects
     socket.on("disconnect", () => {
-      // Remove driver from connections
-      for (const [driverId, socketId] of driverConnections.entries()) {
-        if (socketId === socket.id) {
-          driverConnections.delete(driverId);
-          console.log(`Driver ${driverId} disconnected`);
-          break;
+      const driverId = socket.data?.driverId;
+      if (driverId) {
+        removeDriverSocket(driverId, socket.id);
+        const remaining =
+          driverConnections.get(String(driverId))?.size ?? 0;
+        console.log(
+          `Driver ${driverId} socket ${socket.id} disconnected (remaining tabs/sockets: ${remaining})`,
+        );
+      } else {
+        for (const [did, set] of driverConnections.entries()) {
+          if (set.has(socket.id)) {
+            removeDriverSocket(did, socket.id);
+            console.log(`Driver ${did} socket ${socket.id} disconnected (fallback cleanup)`);
+            break;
+          }
         }
       }
       console.log("Client disconnected:", socket.id);
@@ -191,11 +223,11 @@ const emitRideRequestToDrivers = (driverIds, rideData) => {
 
     onlineDriverIds.forEach((driverId) => {
       const room = driverRoom(driverId);
-      const socketId = driverConnections.get(driverId);
+      const tabCount = driverConnections.get(driverId)?.size ?? 0;
       const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
       io.to(room).emit("ride:new-request", rideData);
       console.log(
-        `Ride ${rideData.ride_id} emitted to driver ${driverId} (socket:${socketId || "unknown"}, roomSize:${roomSize})`,
+        `Ride ${rideData.ride_id} emitted to driver ${driverId} (trackedSockets:${tabCount}, roomSize:${roomSize})`,
       );
     });
 
@@ -217,7 +249,12 @@ const emitRideRequestToDrivers = (driverIds, rideData) => {
  * Return online driver IDs; optional filter by target IDs
  */
 const getOnlineDriverIds = (targetDriverIds = null) => {
-  const onlineDriverIds = Array.from(driverConnections.keys());
+  const onlineDriverIds = [];
+  for (const [driverId, set] of driverConnections.entries()) {
+    if (set && set.size > 0) {
+      onlineDriverIds.push(driverId);
+    }
+  }
 
   if (!Array.isArray(targetDriverIds) || targetDriverIds.length === 0) {
     return onlineDriverIds;
@@ -231,21 +268,28 @@ const getOnlineDriverIds = (targetDriverIds = null) => {
  * Check whether a specific driver is online
  */
 const isDriverOnline = (driverId) => {
-  return driverConnections.has(String(driverId));
+  const set = driverConnections.get(String(driverId));
+  return !!(set && set.size > 0);
 };
 
 /**
  * Get socket ID for a specific driver
  */
 const getDriverSocketId = (driverId) => {
-  return driverConnections.get(String(driverId)) || null;
+  const set = driverConnections.get(String(driverId));
+  if (!set || set.size === 0) return null;
+  return set.values().next().value || null;
 };
 
 /**
  * Get total online driver count
  */
 const getOnlineDriverCount = () => {
-  return driverConnections.size;
+  let n = 0;
+  for (const set of driverConnections.values()) {
+    if (set && set.size > 0) n += 1;
+  }
+  return n;
 };
 
 /**

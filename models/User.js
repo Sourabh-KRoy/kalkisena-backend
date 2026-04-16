@@ -96,6 +96,33 @@ module.exports = (sequelize) => {
       defaultValue: 'users',
       comment: 'Type of user: driver, users, admin, or hotel'
     },
+    driver_mode: {
+      type: DataTypes.ENUM('offline', 'online'),
+      allowNull: false,
+      defaultValue: 'offline',
+      comment: 'Driver presence: offline = not receiving new ride requests'
+    },
+    driver_available_for_rides: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+      comment: 'When online and true, driver may accept a new pending ride'
+    },
+    current_latitude: {
+      type: DataTypes.DECIMAL(10, 8),
+      allowNull: true,
+      comment: 'Last known driver latitude (updated while online)'
+    },
+    current_longitude: {
+      type: DataTypes.DECIMAL(11, 8),
+      allowNull: true,
+      comment: 'Last known driver longitude (updated while online)'
+    },
+    driver_location_updated_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      comment: 'When current_latitude/current_longitude were last updated'
+    },
     profile_image: {
       type: DataTypes.STRING(500),
       allowNull: true,

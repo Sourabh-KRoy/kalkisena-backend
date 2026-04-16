@@ -107,6 +107,18 @@ const markMessagesReadValidation = [
     .isInt({ min: 1 }).withMessage('Ride ID must be a valid integer')
 ];
 
+const setDriverStatusValidation = [
+  body('mode')
+    .notEmpty().withMessage('mode is required')
+    .isIn(['online', 'offline']).withMessage('mode must be online or offline'),
+  body('latitude')
+    .optional()
+    .isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
+  body('longitude')
+    .optional()
+    .isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude')
+];
+
 router.get('/price-estimate', rideController.getPriceEstimate);
 
 router.get('/car-varieties', rideController.getCarVarieties);
@@ -114,6 +126,8 @@ router.get('/car-varieties', rideController.getCarVarieties);
 router.post('/book', authenticateToken, bookRideValidation, rideController.bookRide);
 
 router.get('/available', authenticateToken, rideController.getAvailableRides);
+
+router.post('/driver/status', authenticateToken, setDriverStatusValidation, rideController.setDriverStatus);
 
 router.post('/accept', authenticateToken, acceptRideValidation, rideController.acceptRide);
 
