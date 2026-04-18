@@ -585,6 +585,19 @@ const getAvailableRides = async (req, res) => {
     }
 
     // Get all pending rides (latest first)
+    // const allRides = await Ride.findAll({
+    //   where: whereClause,
+    //   include: [
+    //     {
+    //       model: User,
+    //       as: "user",
+    //       attributes: ["id", "name", "email", "phone"],
+    //     },
+    //   ],
+    //   order: [["created_at", "DESC"]],
+    //   limit: 100,
+    // });
+
     const allRides = await Ride.findAll({
       where: whereClause,
       include: [
@@ -598,10 +611,17 @@ const getAvailableRides = async (req, res) => {
       limit: 100,
     });
 
+    // FILTER HERE
+    const filteredRides = allRides.filter((ride) => {
+      const rejected = ride.rejected_driver_ids || [];
+      return !rejected.includes(Number(driverId));
+    });
+
+    // SINGLE RESPONSE ONLY
     res.json({
       success: true,
       data: {
-        rides: allRides,
+        rides: filteredRides,
         driver_mode: driverUser.driver_mode,
         driver_available_for_rides: driverUser.driver_available_for_rides,
         current_location:
@@ -614,22 +634,7 @@ const getAvailableRides = async (req, res) => {
             : null,
         driver_location_updated_at:
           driverUser.driver_location_updated_at || null,
-        driver_vehicle: driverVehicle
-          ? {
-              id: driverVehicle.id,
-              vehicle_type: driverVehicle.vehicle_type,
-              car_variety: driverVehicle.car_variety,
-              vehicle_number: driverVehicle.vehicle_number,
-              current_location:
-                driverVehicle.current_latitude != null &&
-                driverVehicle.current_longitude != null
-                  ? {
-                      latitude: parseFloat(driverVehicle.current_latitude),
-                      longitude: parseFloat(driverVehicle.current_longitude),
-                    }
-                  : null,
-            }
-          : null,
+        driver_vehicle: null,
         driver_registration_vehicle_type: driverRegistration.vehicle_type,
         driver_registration: {
           user_id: driverRegistration.user_id,
@@ -637,9 +642,52 @@ const getAvailableRides = async (req, res) => {
           vehicle_type: driverRegistration.vehicle_type,
           city_to_ride: driverRegistration.city_to_ride,
         },
-        total_rides: allRides.length,
+        total_rides: filteredRides.length,
       },
     });
+
+    // res.json({
+    //   success: true,
+    //   data: {
+    //     rides: allRides,
+    //     driver_mode: driverUser.driver_mode,
+    //     driver_available_for_rides: driverUser.driver_available_for_rides,
+    //     current_location:
+    //       driverUser.current_latitude != null &&
+    //       driverUser.current_longitude != null
+    //         ? {
+    //             latitude: parseFloat(driverUser.current_latitude),
+    //             longitude: parseFloat(driverUser.current_longitude),
+    //           }
+    //         : null,
+    //     driver_location_updated_at:
+    //       driverUser.driver_location_updated_at || null,
+    //     driver_vehicle: driverVehicle
+    //       ? {
+    //           id: driverVehicle.id,
+    //           vehicle_type: driverVehicle.vehicle_type,
+    //           car_variety: driverVehicle.car_variety,
+    //           vehicle_number: driverVehicle.vehicle_number,
+    //           current_location:
+    //             driverVehicle.current_latitude != null &&
+    //             driverVehicle.current_longitude != null
+    //               ? {
+    //                   latitude: parseFloat(driverVehicle.current_latitude),
+    //                   longitude: parseFloat(driverVehicle.current_longitude),
+    //                 }
+    //               : null,
+    //         }
+    //       : null,
+    //     driver_registration_vehicle_type: driverRegistration.vehicle_type,
+    //     driver_registration: {
+    //       user_id: driverRegistration.user_id,
+    //       status: driverRegistration.status,
+    //       vehicle_type: driverRegistration.vehicle_type,
+    //       city_to_ride: driverRegistration.city_to_ride,
+    //     },
+    //     total_rides: allRides.length,
+    //   },
+    // });
   } catch (error) {
     console.error("Get available rides error:", error);
     res.status(500).json({
@@ -1222,6 +1270,80 @@ const completeRide = async (req, res) => {
   }
 };
 
+const rejectRide = async (req, res) => {
+  try {
+    // FIX: always convert to number
+    const driverId = Number(req.user.id);
+    const { ride_id } = req.body;
+
+    if (req.user.users_type !== "driver") {
+      return res.status(403).json({
+        success: false,
+        message: "Only drivers can reject rides",
+      });
+    }
+
+    if (!ride_id) {
+      return res.status(400).json({
+        success: false,
+        message: "ride_id is required",
+      });
+    }
+
+    const ride = await Ride.findByPk(ride_id);
+
+    if (!ride) {
+      return res.status(404).json({
+        success: false,
+        message: "Ride not found",
+      });
+    }
+
+    if (ride.status !== "pending") {
+      return res.status(400).json({
+        success: false,
+        message: "Ride is not available to reject",
+      });
+    }
+
+    //get existing rejected drivers
+    let rejectedDrivers = ride.rejected_driver_ids || [];
+
+    //FIX: ensure numbers only
+    rejectedDrivers = rejectedDrivers.map(Number);
+
+    // add driver if not already exists
+    if (!rejectedDrivers.includes(driverId)) {
+      rejectedDrivers.push(driverId);
+    }
+
+    // IMPORTANT: force update JSON field
+    ride.setDataValue("rejected_driver_ids", rejectedDrivers);
+
+    await ride.save();
+
+    // debug (optional)
+    // await ride.reload();
+    // console.log("Saved rejected:", ride.rejected_driver_ids);
+
+    return res.json({
+      success: true,
+      message: "Ride rejected successfully",
+      data: {
+        ride_id: ride.id,
+        rejected_driver_ids: rejectedDrivers,
+      },
+    });
+  } catch (error) {
+    console.error("Reject ride error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error rejecting ride",
+      error: error.message,
+    });
+  }
+};
+
 const cancelRide = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -1390,6 +1512,67 @@ const getUserRides = async (req, res) => {
   }
 };
 
+const getUserRidesHistory = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { limit = 20, offset = 0 } = req.query;
+
+    const whereClause = {
+      user_id: userId,
+    };
+
+    whereClause.status = {
+      [Op.in]: ["accepted", "in_progress", "completed", "cancelled"],
+    };
+
+    const rides = await Ride.findAndCountAll({
+      where: whereClause,
+      include: [
+        {
+          model: User,
+          as: "driver",
+          attributes: ["id", "name", "email", "phone"],
+        },
+        {
+          model: Vehicle,
+          as: "vehicle",
+          attributes: [
+            "id",
+            "vehicle_type",
+            "vehicle_number",
+            "vehicle_model",
+            "vehicle_color",
+          ],
+        },
+      ],
+      order: [["created_at", "DESC"]],
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+
+    const ridesData = rides.rows.map((ride) =>
+      attachDriverLocationToRide(ride),
+    );
+
+    res.json({
+      success: true,
+      data: {
+        rides: ridesData,
+        total: rides.count,
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      },
+    });
+  } catch (error) {
+    console.error("Get user rides error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching rides",
+      error: error.message,
+    });
+  }
+};
+
 const getDriverRides = async (req, res) => {
   try {
     if (req.user.users_type !== "driver") {
@@ -1414,6 +1597,86 @@ const getDriverRides = async (req, res) => {
     ) {
       whereClause.status = status;
     }
+
+    const rides = await Ride.findAndCountAll({
+      where: whereClause,
+      include: [
+        {
+          model: User,
+          as: "user",
+          attributes: ["id", "name", "email", "phone"],
+        },
+        {
+          model: Vehicle,
+          as: "vehicle",
+          attributes: [
+            "id",
+            "vehicle_type",
+            "vehicle_number",
+            "vehicle_model",
+            "vehicle_color",
+          ],
+        },
+      ],
+      order: [["created_at", "DESC"]],
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+
+    // Hide ride_otp from driver; only rider can see OTP
+    const ridesData = rides.rows.map((r) => {
+      const j = attachDriverLocationToRide(r);
+      if (j && j.ride_otp) delete j.ride_otp;
+      return j;
+    });
+
+    res.json({
+      success: true,
+      data: {
+        rides: ridesData,
+        total: rides.count,
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      },
+    });
+  } catch (error) {
+    console.error("Get driver rides error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching rides",
+      error: error.message,
+    });
+  }
+};
+
+const getDriverRidesHistory = async (req, res) => {
+  try {
+    if (req.user.users_type !== "driver") {
+      return res.status(403).json({
+        success: false,
+        message: "Only drivers can view driver rides",
+      });
+    }
+
+    const driverId = req.user.id;
+    const { limit = 20, offset = 0 } = req.query;
+
+    const whereClause = {
+      driver_id: driverId,
+    };
+
+    whereClause.status = {
+      [Op.in]: ["accepted", "in_progress", "completed", "cancelled"],
+    };
+
+    // if (status) {
+    //   whereClause.status = status;
+    // } else {
+    //   // default history for driver
+    //   whereClause.status = {
+    //     [Op.in]: ["accepted", "cancelled"], // OR better below
+    //   };
+    // }
 
     const rides = await Ride.findAndCountAll({
       where: whereClause,
@@ -1860,6 +2123,9 @@ module.exports = {
   startRide,
   verifyRideOtp,
   completeRide,
+  getDriverRidesHistory,
+  getUserRidesHistory,
+  rejectRide,
   cancelRide,
   getUserRides,
   getDriverRides,
