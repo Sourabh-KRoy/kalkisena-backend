@@ -347,4 +347,10 @@ router.get(
   locationController.getDriverLocation,
 );
 
+router.get(
+  "/:ride_id/directions-debug",
+  authenticateToken,
+  locationController.getRideDirectionsDebug,
+);
+
 module.exports = router;

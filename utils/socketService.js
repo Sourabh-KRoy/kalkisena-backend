@@ -109,7 +109,12 @@ const initializeSocket = (server) => {
           const { Ride } = require("../models");
           const ride = await Ride.findByPk(data.ride_id);
 
-          if (ride && ride.user_id) {
+          const otpVerified =
+            ride &&
+            ride.status === "in_progress" &&
+            !!ride.otp_verified_at;
+
+          if (otpVerified && ride.user_id) {
             const location = setDriverLocationForRide(
               data.ride_id,
               data.latitude,
@@ -145,7 +150,12 @@ const initializeSocket = (server) => {
           const { Ride } = require("../models");
           const ride = await Ride.findByPk(data.ride_id);
 
-          if (ride && ride.driver_id) {
+          const otpVerified =
+            ride &&
+            ride.status === "in_progress" &&
+            !!ride.otp_verified_at;
+
+          if (otpVerified && ride.driver_id) {
             // Emit to driver
             io.to(driverRoom(ride.driver_id)).emit(
               "ride:user-location-update",

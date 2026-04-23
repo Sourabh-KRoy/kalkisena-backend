@@ -36,10 +36,20 @@ const registerValidation = [
     .matches(/^[+]?[(]?[0-9]{1,4}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?[-\s.]?[0-9]{1,9}$/)
     .withMessage('Please provide a valid phone number'),
   body('gender')
-    .optional()
+    .optional({ values: 'falsy' })
+    .customSanitizer((value) => {
+      if (value === undefined || value === null) return undefined;
+      const trimmed = String(value).trim();
+      return trimmed === '' ? undefined : trimmed.toLowerCase();
+    })
     .isIn(['male', 'female', 'other']).withMessage('Gender must be male, female, or other'),
   body('date_of_birth')
-    .optional()
+    .optional({ values: 'falsy' })
+    .customSanitizer((value) => {
+      if (value === undefined || value === null) return undefined;
+      const trimmed = String(value).trim();
+      return trimmed === '' ? undefined : trimmed;
+    })
     .isISO8601().withMessage('Please provide a valid date (YYYY-MM-DD)'),
   body('google_id')
     .optional()
@@ -69,10 +79,20 @@ const updateProfileValidation = [
     .matches(/^[+]?[(]?[0-9]{1,4}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?[-\s.]?[0-9]{1,9}$/)
     .withMessage('Please provide a valid phone number'),
   body('gender')
-    .optional()
+    .optional({ values: 'falsy' })
+    .customSanitizer((value) => {
+      if (value === undefined || value === null) return undefined;
+      const trimmed = String(value).trim();
+      return trimmed === '' ? undefined : trimmed.toLowerCase();
+    })
     .isIn(['male', 'female', 'other']).withMessage('Gender must be male, female, or other'),
   body('date_of_birth')
-    .optional()
+    .optional({ values: 'falsy' })
+    .customSanitizer((value) => {
+      if (value === undefined || value === null) return undefined;
+      const trimmed = String(value).trim();
+      return trimmed === '' ? undefined : trimmed;
+    })
     .isISO8601().withMessage('Please provide a valid date (YYYY-MM-DD)'),
   body('users_type')
     .optional()
