@@ -1,4 +1,15 @@
-const { User } = require('../models');
+const {
+  User,
+  Ride,
+  RideMessage,
+  UserAddress,
+  PurchaseBook,
+  Payment,
+  JoinKalkisenaClinic,
+  FreeCoachingRegistration,
+  HostelRegistration,
+  sequelize
+} = require('../models');
 const { validationResult } = require('express-validator');
 const { generateToken, getClientIP, generateOTP } = require('../utils/helpers');
 const { sendOTPEmail } = require('../utils/email');
@@ -217,6 +228,98 @@ const logout = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error logging out',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Delete authenticated user's account
+ */
+const deleteAccount = async (req, res) => {
+  try {
+    const user = req.user;
+    const userId = user.id;
+    const { deleteFileFromS3 } = require('../utils/s3Upload');
+
+    if (user.users_type !== 'users') {
+      return res.status(403).json({
+        success: false,
+        message: 'This endpoint is only available for user accounts'
+      });
+    }
+
+    // Capture file URLs first, then clean up from S3 after DB transaction commits.
+    const fileUrlsToDelete = [];
+    if (user.profile_image) {
+      fileUrlsToDelete.push(user.profile_image);
+    }
+
+    await sequelize.transaction(async (transaction) => {
+      const rides = await Ride.findAll({
+        where: {
+          user_id: userId
+        },
+        attributes: ['id'],
+        transaction
+      });
+      const rideIds = rides.map((ride) => ride.id);
+
+      const purchaseRows = await PurchaseBook.findAll({
+        where: { user_id: userId },
+        attributes: ['payment_id'],
+        transaction
+      });
+      const paymentIds = Array.from(
+        new Set(
+          purchaseRows
+            .map((row) => row.payment_id)
+            .filter((paymentId) => paymentId != null)
+        )
+      );
+
+      const rideMessageWhere = {
+        [Op.or]: [{ sender_id: userId }, { receiver_id: userId }]
+      };
+      if (rideIds.length > 0) {
+        rideMessageWhere[Op.or].push({ ride_id: { [Op.in]: rideIds } });
+      }
+
+      await RideMessage.destroy({ where: rideMessageWhere, transaction });
+      await Ride.destroy({
+        where: {
+          user_id: userId
+        },
+        transaction
+      });
+      await UserAddress.destroy({ where: { user_id: userId }, transaction });
+      await PurchaseBook.destroy({ where: { user_id: userId }, transaction });
+      await JoinKalkisenaClinic.destroy({ where: { user_id: userId }, transaction });
+      await FreeCoachingRegistration.destroy({ where: { user_id: userId }, transaction });
+      await HostelRegistration.destroy({ where: { user_id: userId }, transaction });
+      if (paymentIds.length > 0) {
+        await Payment.destroy({ where: { id: { [Op.in]: paymentIds } }, transaction });
+      }
+
+      await User.destroy({
+        where: { id: userId },
+        transaction
+      });
+    });
+
+    for (const fileUrl of fileUrlsToDelete) {
+      await deleteFileFromS3(fileUrl);
+    }
+
+    res.json({
+      success: true,
+      message: 'Account and related data deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting account',
       error: error.message
     });
   }
@@ -541,6 +644,7 @@ module.exports = {
   register,
   login,
   logout,
+  deleteAccount,
   getProfile,
   updateProfile,
   verifyRegistrationOtp,

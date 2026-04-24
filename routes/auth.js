@@ -127,6 +127,7 @@ router.post('/verify-registration-otp', verifyRegistrationOtpValidation, authCon
 router.post('/register', registerValidation, authController.register);
 router.post('/login', loginValidation, authController.login);
 router.post('/logout', authenticateToken, authController.logout);
+router.delete('/delete-account', authenticateToken, authController.deleteAccount);
 router.get('/profile', authenticateToken, authController.getProfile);
 router.put('/profile', authenticateToken, handleProfileImageUpload, updateProfileValidation, authController.updateProfile);
 
