@@ -2,6 +2,7 @@ const { Ride, Vehicle, User, DriverRegistration } = require("../models");
 const { validationResult } = require("express-validator");
 const {
   calculateRidePrice,
+  calculateRidePriceFromMetrics,
   calculateActualRidePrice,
   calculateSurgeMultiplier,
 } = require("../utils/priceCalculation");
@@ -15,7 +16,98 @@ const {
 } = require("../utils/socketService");
 const { generateOTP } = require("../utils/helpers");
 const { Op } = require("sequelize");
-const { all } = require("axios");
+const { getDirections, geocodeAddress } = require("../services/googleMapsService");
+
+const getRouteMetricsWithFallback = async (
+  fromLatitude,
+  fromLongitude,
+  toLatitude,
+  toLongitude,
+) => {
+  try {
+    const directions = await getDirections({
+      originLatitude: parseFloat(fromLatitude),
+      originLongitude: parseFloat(fromLongitude),
+      destinationLatitude: parseFloat(toLatitude),
+      destinationLongitude: parseFloat(toLongitude),
+      mode: "driving",
+    });
+
+    if (
+      directions.status === "OK" &&
+      directions.distanceMeters != null &&
+      directions.durationSeconds != null
+    ) {
+      return {
+        distanceKm: Number((directions.distanceMeters / 1000).toFixed(2)),
+        durationMinutes: Math.max(1, Math.ceil(directions.durationSeconds / 60)),
+        routePolyline: directions.polyline || null,
+        routeSource: "google_directions",
+      };
+    }
+  } catch (error) {
+    console.error("Directions API fallback to haversine:", error.message);
+  }
+
+  const fallback = calculateRidePrice(
+    fromLatitude,
+    fromLongitude,
+    toLatitude,
+    toLongitude,
+    "bike",
+    1.0,
+    null,
+  );
+
+  return {
+    distanceKm: fallback.distance,
+    durationMinutes: fallback.estimatedDuration,
+    routePolyline: null,
+    routeSource: "haversine_fallback",
+  };
+};
+
+const resolveCoordinatesFromAddress = async (address, latitude, longitude) => {
+  const fallbackLatitude = parseFloat(latitude);
+  const fallbackLongitude = parseFloat(longitude);
+
+  if (!address || !String(address).trim()) {
+    return {
+      latitude: fallbackLatitude,
+      longitude: fallbackLongitude,
+      source: "request_coordinates",
+    };
+  }
+
+  try {
+    const geocode = await geocodeAddress(String(address).trim());
+    const geocodedLatitude = geocode?.result?.geometry?.location?.lat;
+    const geocodedLongitude = geocode?.result?.geometry?.location?.lng;
+
+    if (
+      geocode?.status === "OK" &&
+      geocodedLatitude != null &&
+      geocodedLongitude != null
+    ) {
+      return {
+        latitude: parseFloat(geocodedLatitude),
+        longitude: parseFloat(geocodedLongitude),
+        source: "geocoded_address",
+      };
+    }
+  } catch (error) {
+    console.error("Address geocoding fallback to request coordinates:", {
+      address,
+      error: error.message,
+    });
+  }
+
+  return {
+    latitude: fallbackLatitude,
+    longitude: fallbackLongitude,
+    source: "request_coordinates",
+  };
+};
 
 const restoreDriverAvailabilityIfIdle = async (driverId) => {
   if (!driverId) {
@@ -201,6 +293,17 @@ const bookRide = async (req, res) => {
       surge_multiplier,
     } = req.body;
 
+    const resolvedPickup = await resolveCoordinatesFromAddress(
+      from_address,
+      from_latitude,
+      from_longitude,
+    );
+    const resolvedDestination = await resolveCoordinatesFromAddress(
+      to_address,
+      to_latitude,
+      to_longitude,
+    );
+
     if (!["scooty", "bike", "car"].includes(vehicle_type)) {
       return res.status(400).json({
         success: false,
@@ -218,11 +321,16 @@ const bookRide = async (req, res) => {
     }
 
     const surge = surge_multiplier || calculateSurgeMultiplier(1.0);
-    const priceDetails = calculateRidePrice(
-      from_latitude,
-      from_longitude,
-      to_latitude,
-      to_longitude,
+    const routeMetrics = await getRouteMetricsWithFallback(
+      resolvedPickup.latitude,
+      resolvedPickup.longitude,
+      resolvedDestination.latitude,
+      resolvedDestination.longitude,
+    );
+
+    const priceDetails = calculateRidePriceFromMetrics(
+      routeMetrics.distanceKm,
+      routeMetrics.durationMinutes,
       vehicle_type,
       surge,
       car_variety || null,
@@ -235,11 +343,11 @@ const bookRide = async (req, res) => {
       user_id: userId,
       vehicle_type,
       car_variety: vehicle_type === "car" ? car_variety : null,
-      from_latitude,
-      from_longitude,
+      from_latitude: resolvedPickup.latitude,
+      from_longitude: resolvedPickup.longitude,
       from_address,
-      to_latitude,
-      to_longitude,
+      to_latitude: resolvedDestination.latitude,
+      to_longitude: resolvedDestination.longitude,
       to_address,
       distance: priceDetails.distance,
       estimated_duration: priceDetails.estimatedDuration,
@@ -352,13 +460,13 @@ const bookRide = async (req, res) => {
           phone: rideWithUser.user.phone,
         },
         from: {
-          latitude: parseFloat(from_latitude),
-          longitude: parseFloat(from_longitude),
+          latitude: resolvedPickup.latitude,
+          longitude: resolvedPickup.longitude,
           address: from_address,
         },
         to: {
-          latitude: parseFloat(to_latitude),
-          longitude: parseFloat(to_longitude),
+          latitude: resolvedDestination.latitude,
+          longitude: resolvedDestination.longitude,
           address: to_address,
         },
         vehicle_type: vehicle_type,
@@ -372,6 +480,12 @@ const bookRide = async (req, res) => {
         },
         distance: parseFloat(priceDetails.distance),
         estimated_duration: priceDetails.estimatedDuration,
+        route_polyline: routeMetrics.routePolyline,
+        route_source: routeMetrics.routeSource,
+        coordinate_source: {
+          pickup: resolvedPickup.source,
+          destination: resolvedDestination.source,
+        },
         created_at: ride.created_at,
       };
 
@@ -1819,6 +1933,12 @@ const getPriceEstimate = async (req, res) => {
 
     const surge = calculateSurgeMultiplier(1.0);
     const estimates = [];
+    const routeMetrics = await getRouteMetricsWithFallback(
+      from_latitude,
+      from_longitude,
+      to_latitude,
+      to_longitude,
+    );
 
     if (vehicle_type && vehicle_type === "car") {
       const varieties = car_variety
@@ -1828,11 +1948,9 @@ const getPriceEstimate = async (req, res) => {
       for (const variety of varieties) {
         if (!["car_plus", "car_lite", "taxi"].includes(variety)) continue;
 
-        const priceDetails = calculateRidePrice(
-          from_latitude,
-          from_longitude,
-          to_latitude,
-          to_longitude,
+        const priceDetails = calculateRidePriceFromMetrics(
+          routeMetrics.distanceKm,
+          routeMetrics.durationMinutes,
           "car",
           surge,
           variety,
@@ -1862,6 +1980,7 @@ const getPriceEstimate = async (req, res) => {
           time_fare: priceDetails.timeFare,
           surge_multiplier: priceDetails.surgeMultiplier,
           total_fare: priceDetails.totalFare,
+          route_source: routeMetrics.routeSource,
         });
       }
     } else {
@@ -1872,11 +1991,9 @@ const getPriceEstimate = async (req, res) => {
       for (const vType of vehicleTypes) {
         if (!["scooty", "bike", "car"].includes(vType)) continue;
 
-        const priceDetails = calculateRidePrice(
-          from_latitude,
-          from_longitude,
-          to_latitude,
-          to_longitude,
+        const priceDetails = calculateRidePriceFromMetrics(
+          routeMetrics.distanceKm,
+          routeMetrics.durationMinutes,
           vType,
           surge,
           null,
@@ -1900,6 +2017,7 @@ const getPriceEstimate = async (req, res) => {
           time_fare: priceDetails.timeFare,
           surge_multiplier: priceDetails.surgeMultiplier,
           total_fare: priceDetails.totalFare,
+          route_source: routeMetrics.routeSource,
         });
       }
     }
@@ -1936,13 +2054,17 @@ const getCarVarieties = async (req, res) => {
     const surge = calculateSurgeMultiplier(1.0);
     const varieties = ["car_plus", "car_lite", "taxi"];
     const carVarieties = [];
+    const routeMetrics = await getRouteMetricsWithFallback(
+      from_latitude,
+      from_longitude,
+      to_latitude,
+      to_longitude,
+    );
 
     for (const variety of varieties) {
-      const priceDetails = calculateRidePrice(
-        from_latitude,
-        from_longitude,
-        to_latitude,
-        to_longitude,
+      const priceDetails = calculateRidePriceFromMetrics(
+        routeMetrics.distanceKm,
+        routeMetrics.durationMinutes,
         "car",
         surge,
         variety,
@@ -1968,6 +2090,7 @@ const getCarVarieties = async (req, res) => {
         base_fare: priceDetails.baseFare,
         total_fare: priceDetails.totalFare,
         distance: priceDetails.distance,
+        route_source: routeMetrics.routeSource,
       });
     }
 

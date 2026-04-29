@@ -36,6 +36,7 @@ app.use("/api/rides", require("./routes/rides"));
 app.use("/api/book-purchase", require("./routes/bookPurchase"));
 app.use("/api/form", require("./routes/form"));
 app.use("/api/payment", require("./routes/nepalPayment"));
+app.use("/api/food", require("./routes/food"));
 
 // 404 handler
 app.use((req, res) => {

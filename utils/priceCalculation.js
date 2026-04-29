@@ -79,18 +79,34 @@ const calculateSurgeMultiplier = (demandLevel = 1) => {
 const calculateRidePrice = (fromLat, fromLon, toLat, toLon, vehicleType, surgeMultiplier = 1.0, carVariety = null) => {
   const distance = calculateDistance(parseFloat(fromLat), parseFloat(fromLon), parseFloat(toLat), parseFloat(toLon));
   const estimatedDuration = calculateEstimatedTime(distance);
+  return calculateRidePriceFromMetrics(
+    distance,
+    estimatedDuration,
+    vehicleType,
+    surgeMultiplier,
+    carVariety,
+  );
+};
+
+const calculateRidePriceFromMetrics = (
+  distanceKm,
+  estimatedDurationMinutes,
+  vehicleType,
+  surgeMultiplier = 1.0,
+  carVariety = null,
+) => {
   const pricing = getVehiclePricing(vehicleType, carVariety);
   
   let baseFare = pricing.baseFare;
   let distanceFare = 0;
   let timeFare = 0;
   
-  if (distance > pricing.minimumDistance) {
-    const extraDistance = distance - pricing.minimumDistance;
+  if (distanceKm > pricing.minimumDistance) {
+    const extraDistance = distanceKm - pricing.minimumDistance;
     distanceFare = extraDistance * pricing.perKmRate;
   }
   
-  timeFare = estimatedDuration * pricing.perMinuteRate;
+  timeFare = estimatedDurationMinutes * pricing.perMinuteRate;
   
   let totalFare = baseFare + distanceFare + timeFare;
   
@@ -103,8 +119,8 @@ const calculateRidePrice = (fromLat, fromLon, toLat, toLon, vehicleType, surgeMu
   totalFare = Math.round(totalFare * 100) / 100;
   
   return {
-    distance: Math.round(distance * 100) / 100,
-    estimatedDuration,
+    distance: Math.round(distanceKm * 100) / 100,
+    estimatedDuration: Math.max(1, Math.ceil(estimatedDurationMinutes)),
     baseFare: Math.round(baseFare * 100) / 100,
     distanceFare: Math.round(distanceFare * 100) / 100,
     timeFare: Math.round(timeFare * 100) / 100,
@@ -152,6 +168,7 @@ module.exports = {
   calculateDistance,
   calculateEstimatedTime,
   calculateRidePrice,
+  calculateRidePriceFromMetrics,
   calculateActualRidePrice,
   calculateSurgeMultiplier,
   getVehiclePricing

@@ -1,13 +1,16 @@
-const axios = require("axios");
 const { Ride, Vehicle } = require("../models");
 const { validationResult } = require("express-validator");
+const {
+  getDirections,
+  geocodeAddress,
+  reverseGeocode,
+} = require("../services/googleMapsService");
 const {
   emitDriverLocationToUser,
   emitUserLocationToDriver,
   setDriverLocationForRide,
   getDriverLocationForRide,
 } = require("../utils/socketService");
-const { Op } = require("sequelize");
 
 /**
  * Share driver location during active ride
@@ -342,31 +345,14 @@ const getRideDirectionsDebug = async (req, res) => {
     const destinationLatitude = parseFloat(ride.to_latitude);
     const destinationLongitude = parseFloat(ride.to_longitude);
 
-    const mapsApiKey =
-      process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
-    if (!mapsApiKey) {
-      return res.status(500).json({
-        success: false,
-        message:
-          "Google Maps API key missing. Set GOOGLE_MAPS_SERVER_API_KEY or GOOGLE_MAPS_API_KEY",
-      });
-    }
-
-    const directionsUrl = "https://maps.googleapis.com/maps/api/directions/json";
-    const response = await axios.get(directionsUrl, {
-      params: {
-        origin: `${originLatitude},${originLongitude}`,
-        destination: `${destinationLatitude},${destinationLongitude}`,
-        mode: "driving",
-        key: mapsApiKey,
-      },
-      timeout: 8000,
+    const directions = await getDirections({
+      originLatitude,
+      originLongitude,
+      destinationLatitude,
+      destinationLongitude,
+      mode: "driving",
     });
-
-    const directions = response.data || {};
-    const firstRoute = Array.isArray(directions.routes)
-      ? directions.routes[0]
-      : null;
+    const firstRoute = directions.route || null;
 
     return res.json({
       success: true,
@@ -387,9 +373,9 @@ const getRideDirectionsDebug = async (req, res) => {
           longitude: destinationLongitude,
         },
         google_directions_status: directions.status || "UNKNOWN",
-        google_error_message: directions.error_message || null,
+        google_error_message: directions.errorMessage || null,
         route_found: !!firstRoute,
-        overview_polyline: firstRoute?.overview_polyline?.points || null,
+        overview_polyline: directions.polyline || null,
         legs_count: Array.isArray(firstRoute?.legs) ? firstRoute.legs.length : 0,
       },
     });
@@ -403,9 +389,385 @@ const getRideDirectionsDebug = async (req, res) => {
   }
 };
 
+/**
+ * Public route preview between two coordinates.
+ */
+const getRoutePreview = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
+    }
+
+    const {
+      origin_latitude,
+      origin_longitude,
+      destination_latitude,
+      destination_longitude,
+    } = req.query;
+
+    if (
+      origin_latitude == null ||
+      origin_longitude == null ||
+      destination_latitude == null ||
+      destination_longitude == null
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "origin_latitude, origin_longitude, destination_latitude and destination_longitude are required",
+      });
+    }
+
+    const directions = await getDirections({
+      originLatitude: parseFloat(origin_latitude),
+      originLongitude: parseFloat(origin_longitude),
+      destinationLatitude: parseFloat(destination_latitude),
+      destinationLongitude: parseFloat(destination_longitude),
+      mode: "driving",
+    });
+
+    if (directions.status !== "OK" || !directions.leg) {
+      return res.status(400).json({
+        success: false,
+        message: "Unable to fetch route preview",
+        data: {
+          google_directions_status: directions.status,
+          google_error_message: directions.errorMessage,
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        route_found: true,
+        distance_meters: directions.distanceMeters,
+        duration_seconds: directions.durationSeconds,
+        distance_text: directions.distanceText,
+        duration_text: directions.durationText,
+        overview_polyline: directions.polyline,
+      },
+    });
+  } catch (error) {
+    console.error("Get route preview error:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: "Error fetching route preview",
+      error: error.message,
+    });
+  }
+};
+
+const getLiveTrackingSnapshot = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
+    }
+
+    const userId = req.user.id;
+    const { ride_id } = req.params;
+    const { current_latitude, current_longitude } = req.query;
+
+    const ride = await Ride.findByPk(ride_id, {
+      include: [
+        {
+          model: Vehicle,
+          as: "vehicle",
+          attributes: ["id", "current_latitude", "current_longitude"],
+        },
+      ],
+    });
+
+    if (!ride) {
+      return res.status(404).json({
+        success: false,
+        message: "Ride not found",
+      });
+    }
+
+    if (ride.user_id !== userId && ride.driver_id !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to access this ride tracking data",
+      });
+    }
+
+    if (!["pending", "accepted", "in_progress"].includes(ride.status)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Tracking is available only for pending/accepted/in-progress rides",
+      });
+    }
+    if (ride.status === "pending") {
+      const hasRequestedCurrentLocation =
+        current_latitude != null && current_longitude != null;
+      const requestedCurrentLatitude = hasRequestedCurrentLocation
+        ? parseFloat(current_latitude)
+        : null;
+      const requestedCurrentLongitude = hasRequestedCurrentLocation
+        ? parseFloat(current_longitude)
+        : null;
+
+      if (
+        hasRequestedCurrentLocation &&
+        (Number.isNaN(requestedCurrentLatitude) ||
+          Number.isNaN(requestedCurrentLongitude))
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid current location coordinates",
+        });
+      }
+
+      const originLatitude =
+        requestedCurrentLatitude != null
+          ? requestedCurrentLatitude
+          : parseFloat(ride.from_latitude);
+      const originLongitude =
+        requestedCurrentLongitude != null
+          ? requestedCurrentLongitude
+          : parseFloat(ride.from_longitude);
+      const destinationLatitude = parseFloat(ride.to_latitude);
+      const destinationLongitude = parseFloat(ride.to_longitude);
+
+      const directions = await getDirections({
+        originLatitude,
+        originLongitude,
+        destinationLatitude,
+        destinationLongitude,
+        mode: "driving",
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          ride_id: ride.id,
+          ride_status: ride.status,
+          tracking_mode: "user_route_preview",
+          origin: {
+            latitude: originLatitude,
+            longitude: originLongitude,
+            source: hasRequestedCurrentLocation
+              ? "request_current_location"
+              : "ride_pickup_location",
+          },
+          destination: {
+            latitude: destinationLatitude,
+            longitude: destinationLongitude,
+            phase: "drop",
+          },
+          route: {
+            google_directions_status: directions.status,
+            google_error_message: directions.errorMessage,
+            distance_meters: directions.distanceMeters,
+            duration_seconds: directions.durationSeconds,
+            distance_text: directions.distanceText,
+            duration_text: directions.durationText,
+            overview_polyline: directions.polyline,
+          },
+        },
+      });
+    }
+
+    const cachedDriverLocation = getDriverLocationForRide(ride.id);
+    const originLatitude =
+      cachedDriverLocation?.latitude ??
+      (ride.vehicle?.current_latitude != null
+        ? parseFloat(ride.vehicle.current_latitude)
+        : null);
+    const originLongitude =
+      cachedDriverLocation?.longitude ??
+      (ride.vehicle?.current_longitude != null
+        ? parseFloat(ride.vehicle.current_longitude)
+        : null);
+
+    if (originLatitude == null || originLongitude == null) {
+      return res.status(404).json({
+        success: false,
+        message: "Driver location not available yet",
+      });
+    }
+
+    const destinationLatitude =
+      ride.status === "accepted"
+        ? parseFloat(ride.from_latitude)
+        : parseFloat(ride.to_latitude);
+    const destinationLongitude =
+      ride.status === "accepted"
+        ? parseFloat(ride.from_longitude)
+        : parseFloat(ride.to_longitude);
+
+    const directions = await getDirections({
+      originLatitude,
+      originLongitude,
+      destinationLatitude,
+      destinationLongitude,
+      mode: "driving",
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        ride_id: ride.id,
+        ride_status: ride.status,
+        tracking_mode: "driver_live_tracking",
+        driver_location: {
+          latitude: originLatitude,
+          longitude: originLongitude,
+          source: cachedDriverLocation ? "socket_cache" : "vehicle_last_location",
+          timestamp:
+            cachedDriverLocation?.timestamp ||
+            (ride.updated_at ? new Date(ride.updated_at).toISOString() : null),
+        },
+        destination: {
+          latitude: destinationLatitude,
+          longitude: destinationLongitude,
+          phase: ride.status === "accepted" ? "pickup" : "drop",
+        },
+        route: {
+          google_directions_status: directions.status,
+          google_error_message: directions.errorMessage,
+          distance_meters: directions.distanceMeters,
+          duration_seconds: directions.durationSeconds,
+          distance_text: directions.distanceText,
+          duration_text: directions.durationText,
+          overview_polyline: directions.polyline,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Get live tracking snapshot error:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: "Error fetching live tracking snapshot",
+      error: error.message,
+    });
+  }
+};
+
+const getAddressFromCoordinates = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
+    }
+
+    const { latitude, longitude } = req.query;
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({
+        success: false,
+        message: "latitude and longitude are required",
+      });
+    }
+
+    const geocode = await reverseGeocode(
+      parseFloat(latitude),
+      parseFloat(longitude),
+    );
+
+    if (!geocode.result) {
+      return res.status(404).json({
+        success: false,
+        message: "No address found for these coordinates",
+        data: {
+          geocode_status: geocode.status,
+          geocode_error_message: geocode.errorMessage,
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        formatted_address: geocode.result.formatted_address,
+        place_id: geocode.result.place_id || null,
+        geocode_status: geocode.status,
+      },
+    });
+  } catch (error) {
+    console.error("Reverse geocode error:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: "Error reverse geocoding coordinates",
+      error: error.message,
+    });
+  }
+};
+
+const getCoordinatesFromAddress = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
+    }
+
+    const { address } = req.query;
+    if (!address || !String(address).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "address is required",
+      });
+    }
+
+    const geocode = await geocodeAddress(String(address).trim());
+
+    if (!geocode.result || !geocode.result.geometry?.location) {
+      return res.status(404).json({
+        success: false,
+        message: "No coordinates found for this address",
+        data: {
+          geocode_status: geocode.status,
+          geocode_error_message: geocode.errorMessage,
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        formatted_address: geocode.result.formatted_address,
+        latitude: geocode.result.geometry.location.lat,
+        longitude: geocode.result.geometry.location.lng,
+        place_id: geocode.result.place_id || null,
+        geocode_status: geocode.status,
+      },
+    });
+  } catch (error) {
+    console.error("Forward geocode error:", error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: "Error geocoding address",
+      error: error.message,
+    });
+  }
+};
+
 module.exports = {
   shareDriverLocation,
   shareUserLocation,
   getDriverLocation,
   getRideDirectionsDebug,
+  getRoutePreview,
+  getLiveTrackingSnapshot,
+  getAddressFromCoordinates,
+  getCoordinatesFromAddress,
 };

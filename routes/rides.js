@@ -242,8 +242,6 @@ router.get(
 
 router.get("/driver-rides", authenticateToken, rideController.getDriverRides);
 
-router.get("/:ride_id", authenticateToken, rideController.getRideDetails);
-
 router.post(
   "/messages/send",
   authenticateToken,
@@ -352,5 +350,78 @@ router.get(
   authenticateToken,
   locationController.getRideDirectionsDebug,
 );
+
+router.get(
+  "/route-preview",
+  [
+    query("origin_latitude")
+      .notEmpty()
+      .withMessage("origin_latitude is required")
+      .isFloat({ min: -90, max: 90 })
+      .withMessage("Invalid origin_latitude"),
+    query("origin_longitude")
+      .notEmpty()
+      .withMessage("origin_longitude is required")
+      .isFloat({ min: -180, max: 180 })
+      .withMessage("Invalid origin_longitude"),
+    query("destination_latitude")
+      .notEmpty()
+      .withMessage("destination_latitude is required")
+      .isFloat({ min: -90, max: 90 })
+      .withMessage("Invalid destination_latitude"),
+    query("destination_longitude")
+      .notEmpty()
+      .withMessage("destination_longitude is required")
+      .isFloat({ min: -180, max: 180 })
+      .withMessage("Invalid destination_longitude"),
+  ],
+  locationController.getRoutePreview,
+);
+
+router.get(
+  "/geocode",
+  [query("address").trim().notEmpty().withMessage("address is required")],
+  locationController.getCoordinatesFromAddress,
+);
+
+router.get(
+  "/reverse-geocode",
+  [
+    query("latitude")
+      .notEmpty()
+      .withMessage("latitude is required")
+      .isFloat({ min: -90, max: 90 })
+      .withMessage("Invalid latitude"),
+    query("longitude")
+      .notEmpty()
+      .withMessage("longitude is required")
+      .isFloat({ min: -180, max: 180 })
+      .withMessage("Invalid longitude"),
+  ],
+  locationController.getAddressFromCoordinates,
+);
+
+router.get(
+  "/:ride_id/live-tracking",
+  authenticateToken,
+  [
+    param("ride_id")
+      .notEmpty()
+      .withMessage("Ride ID is required")
+      .isInt({ min: 1 })
+      .withMessage("Ride ID must be a valid integer"),
+    query("current_latitude")
+      .optional()
+      .isFloat({ min: -90, max: 90 })
+      .withMessage("Invalid current_latitude"),
+    query("current_longitude")
+      .optional()
+      .isFloat({ min: -180, max: 180 })
+      .withMessage("Invalid current_longitude"),
+  ],
+  locationController.getLiveTrackingSnapshot,
+);
+
+router.get("/:ride_id", authenticateToken, rideController.getRideDetails);
 
 module.exports = router;
