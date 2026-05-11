@@ -135,6 +135,112 @@ class BookPaymentGateway {
 const paymentGateway = new BookPaymentGateway();
 
 /**
+ * eSewa ePay v2 helper (UAT/Test)
+ * Docs: https://developer.esewa.com.np/pages/Epay-V2
+ */
+class EsewaGateway {
+  constructor() {
+    this.productCode = process.env.ESEWA_PRODUCT_CODE || 'EPAYTEST';
+    this.secretKey = process.env.ESEWA_SECRET_KEY || '8gBm/:&EnhH.1/q';
+    this.formUrl = process.env.ESEWA_FORM_URL || 'https://rc-epay.esewa.com.np/api/epay/main/v2/form';
+    this.statusBaseUrl = process.env.ESEWA_STATUS_URL_BASE || 'https://uat.esewa.com.np/api/epay/transaction/status/';
+  }
+
+  /**
+   * eSewa signature: HMAC SHA256, base64
+   * message format: "total_amount=...,transaction_uuid=...,product_code=..."
+   */
+  sign(message) {
+    const digest = crypto
+      .createHmac('sha256', this.secretKey)
+      .update(message)
+      .digest();
+    return digest.toString('base64');
+  }
+
+  /**
+   * Build signature from signed fields list.
+   * signedFields: "a,b,c" -> "a=value,b=value,c=value" (same order)
+   */
+  signatureFromFields(payload, signedFields) {
+    const fields = String(signedFields || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const message = fields.map((k) => `${k}=${payload[k] ?? ''}`).join(',');
+    return { message, signature: this.sign(message) };
+  }
+
+  async checkStatus({ transaction_uuid, total_amount, product_code }) {
+    const params = new URLSearchParams({
+      product_code,
+      total_amount: String(total_amount),
+      transaction_uuid: String(transaction_uuid)
+    });
+    const url = `${this.statusBaseUrl}?${params.toString()}`;
+    const res = await axios.get(url);
+    return res.data;
+  }
+}
+
+const esewaGateway = new EsewaGateway();
+
+const logBookPurchaseEvent = (event, payload = {}) => {
+  console.log(`[BOOK_PURCHASE][${event}]`, {
+    ...payload,
+    at: new Date().toISOString()
+  });
+};
+
+/**
+ * Normalize payment method from request.
+ * Supports: payment_method, paymentMethod
+ */
+const normalizePaymentMethod = (reqBody = {}) => {
+  const raw =
+    reqBody.payment_method ??
+    reqBody.paymentMethod ??
+    reqBody.gateway ??
+    reqBody.payment_gateway ??
+    reqBody.paymentGateway ??
+    reqBody.method ??
+    reqBody.provider ??
+    'nepalpayment';
+  const normalized = String(raw).toLowerCase().replace(/[\s_-]/g, '');
+  if (normalized === 'esewa' || normalized === 'esewaepay') return 'esewa';
+  if (normalized === 'nepalpayment' || normalized === 'nepalpay' || normalized === 'nepal') return 'nepalpayment';
+  return 'nepalpayment';
+};
+
+const resolvePaymentMethodDebug = (reqBody = {}) => {
+  const candidates = {
+    payment_method: reqBody.payment_method,
+    paymentMethod: reqBody.paymentMethod,
+    gateway: reqBody.gateway,
+    payment_gateway: reqBody.payment_gateway,
+    paymentGateway: reqBody.paymentGateway,
+    method: reqBody.method,
+    provider: reqBody.provider
+  };
+
+  const selectedRaw =
+    candidates.payment_method ??
+    candidates.paymentMethod ??
+    candidates.gateway ??
+    candidates.payment_gateway ??
+    candidates.paymentGateway ??
+    candidates.method ??
+    candidates.provider ??
+    'nepalpayment';
+
+  const normalized = String(selectedRaw).toLowerCase().replace(/[\s_-]/g, '');
+  const resolved = normalizePaymentMethod(reqBody);
+
+  return { candidates, selectedRaw, normalized, resolved };
+};
+
+/**
  * Add a new book
  */
 const addBook = async (req, res) => {
@@ -249,6 +355,7 @@ const getBook = async (req, res) => {
 const getAddresses = async (req, res) => {
   try {
     const userId = req.user.id;
+    logBookPurchaseEvent('GET_ADDRESSES_REQUEST', { user_id: userId });
 
     const addresses = await UserAddress.findAll({
       where: { user_id: userId },
@@ -263,6 +370,7 @@ const getAddresses = async (req, res) => {
       message: 'Addresses retrieved successfully',
       data: addresses
     });
+    logBookPurchaseEvent('GET_ADDRESSES_SUCCESS', { user_id: userId, count: addresses.length });
   } catch (error) {
     console.error('Get addresses error:', error);
     res.status(500).json({
@@ -289,6 +397,11 @@ const addAddress = async (req, res) => {
 
     const userId = req.user.id;
     const { address, city, state, postal_code, country, phone_number, is_default, label } = req.body;
+    logBookPurchaseEvent('ADD_ADDRESS_REQUEST', {
+      user_id: userId,
+      is_default: Boolean(is_default),
+      label: label || null
+    });
 
     // If this is set as default, unset other default addresses
     if (is_default) {
@@ -315,6 +428,7 @@ const addAddress = async (req, res) => {
       message: 'Address added successfully',
       data: newAddress
     });
+    logBookPurchaseEvent('ADD_ADDRESS_SUCCESS', { user_id: userId, address_id: newAddress.id });
   } catch (error) {
     console.error('Add address error:', error);
     res.status(500).json({
@@ -342,6 +456,11 @@ const updateAddress = async (req, res) => {
     const userId = req.user.id;
     const addressId = req.params.id;
     const { address, city, state, postal_code, country, phone_number, is_default, label } = req.body;
+    logBookPurchaseEvent('UPDATE_ADDRESS_REQUEST', {
+      user_id: userId,
+      address_id: Number(addressId),
+      is_default: is_default !== undefined ? Boolean(is_default) : undefined
+    });
 
     // Check if address exists and belongs to user
     const existingAddress = await UserAddress.findOne({
@@ -380,6 +499,7 @@ const updateAddress = async (req, res) => {
       message: 'Address updated successfully',
       data: existingAddress
     });
+    logBookPurchaseEvent('UPDATE_ADDRESS_SUCCESS', { user_id: userId, address_id: Number(addressId) });
   } catch (error) {
     console.error('Update address error:', error);
     res.status(500).json({
@@ -397,6 +517,7 @@ const deleteAddress = async (req, res) => {
   try {
     const userId = req.user.id;
     const addressId = req.params.id;
+    logBookPurchaseEvent('DELETE_ADDRESS_REQUEST', { user_id: userId, address_id: Number(addressId) });
 
     const address = await UserAddress.findOne({
       where: { id: addressId, user_id: userId }
@@ -415,6 +536,7 @@ const deleteAddress = async (req, res) => {
       success: true,
       message: 'Address deleted successfully'
     });
+    logBookPurchaseEvent('DELETE_ADDRESS_SUCCESS', { user_id: userId, address_id: Number(addressId) });
   } catch (error) {
     console.error('Delete address error:', error);
     res.status(500).json({
@@ -443,8 +565,30 @@ const purchaseBook = async (req, res) => {
     }
 
     const userId = req.user.id;
-    const { book_id, quantity = 1, address_id, address, city, state, postal_code, country, phone_number, notes } = req.body;
-    console.log('Purchase book request:', req.body);
+    const {
+      book_id,
+      quantity = 1,
+      address_id,
+      address,
+      city,
+      state,
+      postal_code,
+      country,
+      phone_number,
+      notes
+    } = req.body;
+    const payment_method = normalizePaymentMethod(req.body);
+    const paymentMethodDebug = resolvePaymentMethodDebug(req.body);
+    console.log('[BOOK_PURCHASE] Incoming purchase request:', {
+      user_id: userId,
+      book_id,
+      quantity,
+      payment_inputs: paymentMethodDebug.candidates,
+      selected_raw: paymentMethodDebug.selectedRaw,
+      normalized: paymentMethodDebug.normalized,
+      resolved_gateway: paymentMethodDebug.resolved
+    });
+    console.log('[BOOK_PURCHASE] Full request body:', req.body);
 
     // Get the book
     const book = await Book.findByPk(book_id);
@@ -480,6 +624,11 @@ const purchaseBook = async (req, res) => {
     };
 
     if (address_id) {
+      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
+        user_id: userId,
+        address_id: Number(address_id),
+        mode: 'saved_address'
+      });
       // Use saved address
       const savedAddress = await UserAddress.findOne({
         where: { id: address_id, user_id: userId }
@@ -501,6 +650,10 @@ const purchaseBook = async (req, res) => {
         phone_number: savedAddress.phone_number || req.user.phone
       };
     } else {
+      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
+        user_id: userId,
+        mode: 'manual_address'
+      });
       // Use address from request body
       if (!address) {
         return res.status(400).json({
@@ -531,9 +684,91 @@ const purchaseBook = async (req, res) => {
     let payment;
     let processId = null;
     
+    // Prepare purchase data to store in payment record (will be used to create purchase after payment success)
+    const purchaseData = {
+      user_id: userId,
+      book_id: book.id,
+      quantity,
+      unit_price: unitPrice,
+      total_price: totalPrice,
+      address: deliveryAddress.address,
+      city: deliveryAddress.city,
+      state: deliveryAddress.state,
+      postal_code: deliveryAddress.postal_code,
+      country: deliveryAddress.country,
+      phone_number: deliveryAddress.phone_number,
+      notes: notes || null
+    };
+
+    if (payment_method === 'esewa') {
+      const appUrl = process.env.APP_URL || 'http://localhost:3000';
+      const successUrl = process.env.ESEWA_SUCCESS_URL || `${appUrl}/api/book-purchase/esewa/success`;
+      const failureUrl = process.env.ESEWA_FAILURE_URL || `${appUrl}/api/book-purchase/esewa/failure`;
+
+      // eSewa requires transaction_uuid to be alphanumeric and hyphen(-) only.
+      const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
+      const signedFieldNames = 'total_amount,transaction_uuid,product_code';
+
+      const esewaPayload = {
+        amount: String(totalPrice),
+        tax_amount: '0',
+        total_amount: String(totalPrice),
+        transaction_uuid: transactionUuid,
+        product_code: esewaGateway.productCode,
+        product_service_charge: '0',
+        product_delivery_charge: '0',
+        success_url: successUrl,
+        failure_url: failureUrl,
+        signed_field_names: signedFieldNames
+      };
+
+      const { signature, message } = esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
+      esewaPayload.signature = signature;
+
+      // Save payment record with purchase data in gateway_response
+      payment = await Payment.create({
+        order_id: transactionUuid,
+        amount: totalPrice,
+        process_id: null,
+        status: 'INITIATED',
+        gateway_response: JSON.stringify({
+          gateway: 'ESEWA',
+          signature_message: message,
+          payment_request: esewaPayload,
+          purchase_data: purchaseData
+        })
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: 'eSewa payment initialized. Please complete the payment. Purchase will be created after successful payment.',
+        data: {
+          gateway: 'ESEWA',
+          payment_method: 'esewa',
+          paymentMethod: 'esewa',
+          order_id: transactionUuid,
+          amount: totalPrice,
+          payment_url: esewaGateway.formUrl,
+          form_data: esewaPayload,
+          book: {
+            id: book.id,
+            title: book.title,
+            author: book.author,
+            image_url: book.image_url
+          },
+          debug: {
+            resolved_gateway: payment_method,
+            selected_input: paymentMethodDebug.selectedRaw,
+            normalized_input: paymentMethodDebug.normalized
+          }
+        }
+      });
+    }
+
+    // Default: NepalPayment (keep apisandbox integration)
     try {
       const paymentResponse = await paymentGateway.createPayment(totalPrice.toString(), orderId);
-      
+
       if (!paymentResponse.code || paymentResponse.code !== '0') {
         return res.status(400).json({
           success: false,
@@ -544,30 +779,13 @@ const purchaseBook = async (req, res) => {
 
       processId = paymentResponse.data?.ProcessId || null;
 
-      // Prepare purchase data to store in payment record (will be used to create purchase after payment success)
-      const purchaseData = {
-        user_id: userId,
-        book_id: book.id,
-        quantity,
-        unit_price: unitPrice,
-        total_price: totalPrice,
-        address: deliveryAddress.address,
-        city: deliveryAddress.city,
-        state: deliveryAddress.state,
-        postal_code: deliveryAddress.postal_code,
-        country: deliveryAddress.country,
-        phone_number: deliveryAddress.phone_number,
-        notes: notes || null
-      };
-
-      // Save payment record with purchase data in gateway_response
-      // Structure: { payment_response: {...}, purchase_data: {...} }
       payment = await Payment.create({
         order_id: orderId,
         amount: totalPrice,
         process_id: processId,
         status: 'INITIATED',
         gateway_response: JSON.stringify({
+          gateway: 'NEPALPAYMENT',
           payment_response: paymentResponse,
           purchase_data: purchaseData
         })
@@ -581,15 +799,16 @@ const purchaseBook = async (req, res) => {
       });
     }
 
-    // Payment gateway URLs
     const paymentUrl = process.env.NEPAL_PAYMENT_GATEWAY_URL || 'https://gatewaysandbox.nepalpayment.com/Payment/Index';
     const responseUrl = process.env.NEPAL_PAYMENT_RESPONSE_URL || `${process.env.APP_URL || 'http://localhost:3000'}/api/book-purchase/payment-callback`;
 
-    // Return payment URL and form data (NO purchase record created yet)
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: 'Payment initialized. Please complete the payment. Purchase will be created after successful payment.',
       data: {
+        gateway: 'NEPALPAYMENT',
+        payment_method: 'nepalpayment',
+        paymentMethod: 'nepalpayment',
         order_id: orderId,
         amount: totalPrice,
         payment_url: paymentUrl,
@@ -606,6 +825,11 @@ const purchaseBook = async (req, res) => {
           title: book.title,
           author: book.author,
           image_url: book.image_url
+        },
+        debug: {
+          resolved_gateway: payment_method,
+          selected_input: paymentMethodDebug.selectedRaw,
+          normalized_input: paymentMethodDebug.normalized
         }
       }
     });
@@ -858,6 +1082,185 @@ const paymentCallback = async (req, res) => {
 };
 
 /**
+ * eSewa success redirect handler (GET)
+ * eSewa sends a base64-encoded response payload (commonly as `data` query param).
+ * We verify signature, optionally verify status from eSewa, then create purchase.
+ */
+const esewaSuccessCallback = async (req, res) => {
+  try {
+    const encoded = req.query.data || req.query.response || req.query.payload;
+    if (!encoded) {
+      return res.status(400).json({ success: false, message: 'Missing eSewa response payload' });
+    }
+
+    let decoded;
+    try {
+      decoded = JSON.parse(Buffer.from(String(encoded), 'base64').toString('utf-8'));
+    } catch (e) {
+      return res.status(400).json({ success: false, message: 'Invalid eSewa payload encoding' });
+    }
+
+    const {
+      status,
+      signature,
+      transaction_uuid,
+      total_amount,
+      product_code,
+      signed_field_names
+    } = decoded || {};
+
+    if (!transaction_uuid) {
+      return res.status(400).json({ success: false, message: 'transaction_uuid missing in eSewa payload' });
+    }
+
+    const payment = await Payment.findOne({ where: { order_id: transaction_uuid } });
+    if (!payment) {
+      return res.status(404).json({ success: false, message: 'Payment record not found' });
+    }
+
+    // Verify response signature integrity (best-effort)
+    let signatureValid = false;
+    if (signature && signed_field_names) {
+      const { signature: expectedSig } = esewaGateway.signatureFromFields(decoded, signed_field_names);
+      signatureValid = expectedSig === signature;
+    }
+
+    // Verify status from eSewa status API (authoritative)
+    let statusApiResult = null;
+    try {
+      statusApiResult = await esewaGateway.checkStatus({
+        transaction_uuid,
+        total_amount,
+        product_code: product_code || esewaGateway.productCode
+      });
+    } catch (e) {
+      statusApiResult = { error: e.response?.data || e.message };
+    }
+
+    const finalStatus = statusApiResult?.status || status || 'UNKNOWN';
+    const paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+
+    // Preserve purchase_data stored at initialization
+    let gatewayResponseData = {};
+    try {
+      if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
+    } catch (e) {}
+
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'ESEWA',
+        response_payload: decoded,
+        signature_valid: signatureValid,
+        status_api: statusApiResult,
+        purchase_data: gatewayResponseData.purchase_data || null
+      }),
+      updated_at: new Date()
+    });
+
+    if (finalStatus !== 'COMPLETE') {
+      return res.status(200).json({
+        success: false,
+        message: 'eSewa payment not complete',
+        data: { status: finalStatus, order_id: transaction_uuid, signature_valid: signatureValid }
+      });
+    }
+
+    // Create purchase if not exists
+    let purchase = await PurchaseBook.findOne({ where: { tracking_number: transaction_uuid } });
+    if (!purchase) {
+      const purchaseData = gatewayResponseData.purchase_data;
+      if (!purchaseData) {
+        return res.status(400).json({ success: false, message: 'Purchase data not found in payment record' });
+      }
+
+      const book = await Book.findByPk(purchaseData.book_id);
+      if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
+      if (!book.is_active) return res.status(400).json({ success: false, message: 'Book is not available for purchase' });
+      if (book.stock < purchaseData.quantity) {
+        return res.status(400).json({ success: false, message: `Insufficient stock. Only ${book.stock} available.` });
+      }
+
+      purchase = await PurchaseBook.create({
+        payment_id: payment.id,
+        user_id: purchaseData.user_id,
+        book_id: purchaseData.book_id,
+        quantity: purchaseData.quantity,
+        unit_price: purchaseData.unit_price,
+        total_price: purchaseData.total_price,
+        address: purchaseData.address,
+        city: purchaseData.city,
+        state: purchaseData.state,
+        postal_code: purchaseData.postal_code,
+        country: purchaseData.country,
+        phone_number: purchaseData.phone_number,
+        notes: purchaseData.notes,
+        status: 'processing',
+        tracking_number: transaction_uuid
+      });
+
+      await book.update({ stock: book.stock - purchaseData.quantity });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'eSewa payment complete. Purchase created/confirmed.',
+      data: { order_id: transaction_uuid, purchase_id: purchase.id }
+    });
+  } catch (error) {
+    console.error('eSewa success callback error:', error);
+    return res.status(500).json({ success: false, message: 'Error processing eSewa success callback', error: error.message });
+  }
+};
+
+/**
+ * eSewa failure redirect handler (GET)
+ */
+const esewaFailureCallback = async (req, res) => {
+  try {
+    const encoded = req.query.data || req.query.response || req.query.payload;
+    let decoded = null;
+    if (encoded) {
+      try {
+        decoded = JSON.parse(Buffer.from(String(encoded), 'base64').toString('utf-8'));
+      } catch (e) {
+        decoded = null;
+      }
+    }
+
+    const transaction_uuid = decoded?.transaction_uuid || req.query.transaction_uuid;
+    if (transaction_uuid) {
+      const payment = await Payment.findOne({ where: { order_id: transaction_uuid } });
+      if (payment) {
+        let gatewayResponseData = {};
+        try {
+          if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
+        } catch (e) {}
+
+        await payment.update({
+          status: 'FAILED',
+          gateway_response: JSON.stringify({
+            gateway: 'ESEWA',
+            response_payload: decoded,
+            purchase_data: gatewayResponseData.purchase_data || null
+          }),
+          updated_at: new Date()
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: false,
+      message: 'eSewa payment failed/cancelled',
+      data: { order_id: transaction_uuid || null, payload: decoded }
+    });
+  } catch (error) {
+    console.error('eSewa failure callback error:', error);
+    return res.status(500).json({ success: false, message: 'Error processing eSewa failure callback', error: error.message });
+  }
+};
+
+/**
  * Check payment status for a purchase
  */
 const checkPaymentStatus = async (req, res) => {
@@ -1014,5 +1417,7 @@ module.exports = {
   getPurchaseHistory,
   getPurchaseById,
   paymentCallback,
+  esewaSuccessCallback,
+  esewaFailureCallback,
   checkPaymentStatus
 };

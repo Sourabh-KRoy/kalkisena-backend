@@ -32,6 +32,14 @@ module.exports = (sequelize) => {
       type: DataTypes.STRING(150),
       allowNull: true
     },
+    payment_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+      references: {
+        model: 'payments',
+        key: 'id'
+      }
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: true,
@@ -57,12 +65,19 @@ module.exports = (sequelize) => {
     ]
   });
 
-  // Define association with User model
+  // Define association with User and Payment models
   JoinKalkisenaClinic.associate = function(models) {
     JoinKalkisenaClinic.belongsTo(models.User, {
       foreignKey: 'user_id',
       as: 'user'
     });
+
+    if (models.Payment) {
+      JoinKalkisenaClinic.belongsTo(models.Payment, {
+        foreignKey: 'payment_id',
+        as: 'payment'
+      });
+    }
   };
 
   return JoinKalkisenaClinic;

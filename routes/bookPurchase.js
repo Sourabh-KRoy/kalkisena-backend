@@ -7,6 +7,16 @@ const { authenticateToken } = require('../middleware/auth');
 /**
  * Validation rules
  */
+router.use((req, res, next) => {
+  console.log('[BOOK_PURCHASE][API_HIT]', {
+    method: req.method,
+    path: req.originalUrl,
+    has_auth_header: Boolean(req.headers.authorization),
+    at: new Date().toISOString()
+  });
+  next();
+});
+
 const addAddressValidation = [
   body('address')
     .trim()
@@ -80,6 +90,26 @@ const updateAddressValidation = [
 ];
 
 const purchaseBookValidation = [
+  body().custom((value, { req }) => {
+    const rawMethod =
+      req.body.payment_method ??
+      req.body.paymentMethod ??
+      req.body.gateway ??
+      req.body.payment_gateway ??
+      req.body.paymentGateway ??
+      req.body.method ??
+      req.body.provider;
+    if (rawMethod === undefined || rawMethod === null || rawMethod === '') {
+      return true; // backward compatibility: default to nepalpayment
+    }
+
+    const normalized = String(rawMethod).toLowerCase().replace(/[\s_-]/g, '');
+    const allowed = ['nepalpayment', 'nepalpay', 'nepal', 'esewa', 'esewaepay'];
+    if (!allowed.includes(normalized)) {
+      throw new Error('payment_method/paymentMethod must be one of: nepalpayment, esewa');
+    }
+    return true;
+  }),
   body('book_id')
     .notEmpty().withMessage('Book ID is required')
     .isInt().withMessage('Book ID must be an integer'),
@@ -227,6 +257,8 @@ router.get('/purchases/:id', authenticateToken, [param('id').isInt().withMessage
 
 // Payment routes
 router.post('/payment-callback', bookPurchaseController.paymentCallback); // No auth - called by payment gateway
+router.get('/esewa/success', bookPurchaseController.esewaSuccessCallback); // No auth - called by eSewa redirect
+router.get('/esewa/failure', bookPurchaseController.esewaFailureCallback); // No auth - called by eSewa redirect
 router.post('/check-payment-status', authenticateToken, [
   body('order_id').optional().trim().notEmpty().withMessage('Order ID is required if provided'),
   body('purchase_id').optional().isInt().withMessage('Purchase ID must be an integer'),

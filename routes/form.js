@@ -98,9 +98,30 @@ const registerHostelValidation = [
 ];
 
 /**
+ * Validation rules for Check Kalki Sena Membership Payment Status
+ */
+const checkJoinKalkiSenaPaymentStatusValidation = [
+  body('order_id')
+    .trim()
+    .notEmpty().withMessage('Order ID is required')
+];
+
+/**
  * Routes
  */
 router.post('/join-kalki-sena', joinKalkiSenaValidation, formController.joinKalkiSena);
+
+// eSewa callbacks for Kalki Sena membership payment (no auth - called by eSewa redirect)
+router.get('/join-kalki-sena/esewa/success', formController.joinKalkiSenaEsewaSuccess);
+router.get('/join-kalki-sena/esewa/failure', formController.joinKalkiSenaEsewaFailure);
+
+// Manual status check (useful if redirect was missed)
+router.post(
+  '/join-kalki-sena/check-payment-status',
+  checkJoinKalkiSenaPaymentStatusValidation,
+  formController.checkJoinKalkiSenaPaymentStatus
+);
+
 router.post('/register-coaching', registerCoachingValidation, formController.registerCoaching);
 router.post('/register-hostel', registerHostelValidation, formController.registerHostel);
 
