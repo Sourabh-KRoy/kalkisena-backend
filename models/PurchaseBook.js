@@ -55,7 +55,7 @@ module.exports = (sequelize) => {
     address: {
       type: DataTypes.TEXT,
       allowNull: false,
-      comment: 'Delivery address for the purchase'
+      comment: 'Fulfillment note; home delivery not used — clinic pickup after ~2 months unless legacy address supplied'
     },
     city: {
       type: DataTypes.STRING(100),

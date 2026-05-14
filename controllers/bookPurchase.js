@@ -5,6 +5,13 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 /**
+ * Books are collected from the clinic (no home delivery). Stored in
+ * `purchase_book.address` when the client does not send shipping details.
+ */
+const BOOK_CLINIC_PICKUP_ADDRESS_LINE =
+  'Clinic pickup — Kalkiism Research and Training Center (Kuleshwor). Ready approximately 2 months after payment. No home delivery.';
+
+/**
  * Payment Gateway Helper Class
  */
 class BookPaymentGateway {
@@ -550,8 +557,9 @@ const deleteAddress = async (req, res) => {
 /**
  * Purchase book with payment gateway integration
  * Fixed price: 1000 rupees
- * If address_id is provided, use that address
- * Otherwise, use the address details from request body
+ *
+ * Delivery is not used: books are picked up from the clinic after ~2 months.
+ * `address_id` / address fields are optional; when omitted, a standard clinic-pickup line is stored.
  */
 const purchaseBook = async (req, res) => {
   try {
@@ -613,14 +621,14 @@ const purchaseBook = async (req, res) => {
       });
     }
 
-    // Get delivery address
+    // Optional shipping-style fields (legacy / optional). Default: clinic pickup only.
     let deliveryAddress = {
-      address: null,
+      address: BOOK_CLINIC_PICKUP_ADDRESS_LINE,
       city: null,
       state: null,
       postal_code: null,
       country: 'Nepal',
-      phone_number: null
+      phone_number: req.user.phone || phone_number || null
     };
 
     if (address_id) {
@@ -629,7 +637,6 @@ const purchaseBook = async (req, res) => {
         address_id: Number(address_id),
         mode: 'saved_address'
       });
-      // Use saved address
       const savedAddress = await UserAddress.findOne({
         where: { id: address_id, user_id: userId }
       });
@@ -647,29 +654,26 @@ const purchaseBook = async (req, res) => {
         state: savedAddress.state,
         postal_code: savedAddress.postal_code,
         country: savedAddress.country,
-        phone_number: savedAddress.phone_number || req.user.phone
+        phone_number: savedAddress.phone_number || req.user.phone || phone_number || null
       };
-    } else {
+    } else if (address && String(address).trim()) {
       logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
         user_id: userId,
         mode: 'manual_address'
       });
-      // Use address from request body
-      if (!address) {
-        return res.status(400).json({
-          success: false,
-          message: 'Address is required'
-        });
-      }
-
       deliveryAddress = {
-        address,
-        city,
-        state,
-        postal_code,
+        address: String(address).trim(),
+        city: city || null,
+        state: state || null,
+        postal_code: postal_code || null,
         country: country || 'Nepal',
-        phone_number: phone_number || req.user.phone
+        phone_number: phone_number || req.user.phone || null
       };
+    } else {
+      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
+        user_id: userId,
+        mode: 'clinic_pickup_default'
+      });
     }
 
     // Fixed price: 1000 rupees
@@ -1045,7 +1049,7 @@ const paymentCallback = async (req, res) => {
           quantity: purchaseData.quantity,
           unit_price: purchaseData.unit_price,
           total_price: purchaseData.total_price,
-          address: purchaseData.address,
+          address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
           city: purchaseData.city,
           state: purchaseData.state,
           postal_code: purchaseData.postal_code,
@@ -1188,7 +1192,7 @@ const esewaSuccessCallback = async (req, res) => {
         quantity: purchaseData.quantity,
         unit_price: purchaseData.unit_price,
         total_price: purchaseData.total_price,
-        address: purchaseData.address,
+        address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
         city: purchaseData.city,
         state: purchaseData.state,
         postal_code: purchaseData.postal_code,
@@ -1351,7 +1355,7 @@ const checkPaymentStatus = async (req, res) => {
             quantity: purchaseData.quantity,
             unit_price: purchaseData.unit_price,
             total_price: purchaseData.total_price,
-            address: purchaseData.address,
+            address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
             city: purchaseData.city,
             state: purchaseData.state,
             postal_code: purchaseData.postal_code,

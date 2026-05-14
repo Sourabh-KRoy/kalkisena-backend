@@ -117,25 +117,13 @@ const purchaseBookValidation = [
     .optional()
     .isInt({ min: 1 }).withMessage('Quantity must be a positive integer'),
   body('address_id')
-    .optional()
-    .isInt().withMessage('Address ID must be an integer')
-    .custom((value, { req }) => {
-      // If address_id is provided, address fields are not required
-      if (value) {
-        return true;
-      }
-      // If address_id is not provided, address is required
-      if (!req.body.address) {
-        throw new Error('Either address_id or address is required');
-      }
-      return true;
-    }),
+    .optional({ nullable: true, checkFalsy: true })
+    .isInt().withMessage('Address ID must be an integer'),
   body('address')
-    .optional()
+    .optional({ nullable: true, checkFalsy: true })
     .trim()
     .isLength({ min: 5, max: 500 }).withMessage('Address must be between 5 and 500 characters')
     .custom((value, { req }) => {
-      // If address is provided, address_id should not be provided
       if (value && req.body.address_id) {
         throw new Error('Provide either address_id or address, not both');
       }
