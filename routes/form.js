@@ -4,6 +4,30 @@ const { body } = require('express-validator');
 const formController = require('../controllers/formController');
 
 /**
+ * Optional payment gateway selection (esewa | nepalpayment).
+ * Defaults to esewa when omitted (existing clients).
+ */
+const paymentMethodValidation = body().custom((value, { req }) => {
+  const rawMethod =
+    req.body.payment_method ??
+    req.body.paymentMethod ??
+    req.body.gateway ??
+    req.body.payment_gateway ??
+    req.body.paymentGateway ??
+    req.body.method ??
+    req.body.provider;
+  if (rawMethod === undefined || rawMethod === null || rawMethod === '') {
+    return true;
+  }
+  const normalized = String(rawMethod).toLowerCase().replace(/[\s_-]/g, '');
+  const allowed = ['nepalpayment', 'nepalpay', 'nepal', 'esewa', 'esewaepay'];
+  if (!allowed.includes(normalized)) {
+    throw new Error('payment_method must be one of: esewa, nepalpayment');
+  }
+  return true;
+});
+
+/**
  * Validation rules for Join Kalki Sena Clinic
  *
  * Only `user_id` is required from the client. Donor fields
@@ -218,11 +242,18 @@ const checkDonateDoctorsPaymentStatusValidation = [
 /**
  * Routes
  */
-router.post('/join-kalki-sena', joinKalkiSenaValidation, formController.joinKalkiSena);
+router.post(
+  '/join-kalki-sena',
+  [paymentMethodValidation, ...joinKalkiSenaValidation],
+  formController.joinKalkiSena
+);
 
 // eSewa callbacks for Kalki Sena membership payment (no auth - called by eSewa redirect)
 router.get('/join-kalki-sena/esewa/success', formController.joinKalkiSenaEsewaSuccess);
 router.get('/join-kalki-sena/esewa/failure', formController.joinKalkiSenaEsewaFailure);
+
+// Nepal Payment callback (no auth - called by Nepal Payment gateway)
+router.post('/join-kalki-sena/payment-callback', formController.joinKalkiSenaPaymentCallback);
 
 // Manual status check (useful if redirect was missed)
 router.post(
@@ -234,12 +265,19 @@ router.post(
 router.post('/register-coaching', registerCoachingValidation, formController.registerCoaching);
 router.post('/register-hostel', registerHostelValidation, formController.registerHostel);
 
-// Donate to Abolish Dowry Culture (eSewa)
-router.post('/donate-abolish-dowry', donateAbolishDowryValidation, formController.donateAbolishDowry);
+// Donate to Abolish Dowry Culture (eSewa or Nepal Payment)
+router.post(
+  '/donate-abolish-dowry',
+  [paymentMethodValidation, ...donateAbolishDowryValidation],
+  formController.donateAbolishDowry
+);
 
 // eSewa callbacks for Donate Abolish Dowry (no auth - called by eSewa redirect)
 router.get('/donate-abolish-dowry/esewa/success', formController.donateAbolishDowryEsewaSuccess);
 router.get('/donate-abolish-dowry/esewa/failure', formController.donateAbolishDowryEsewaFailure);
+
+// Nepal Payment callback (no auth)
+router.post('/donate-abolish-dowry/payment-callback', formController.donateAbolishDowryPaymentCallback);
 
 // Manual status check (useful if redirect was missed)
 router.post(
@@ -248,12 +286,19 @@ router.post(
   formController.checkDonateAbolishDowryPaymentStatus
 );
 
-// Donate to Doctors / Kalkiism Free Clinic (eSewa)
-router.post('/donate-doctors', donateDoctorsValidation, formController.donateDoctors);
+// Donate to Doctors / Kalkiism Free Clinic (eSewa or Nepal Payment)
+router.post(
+  '/donate-doctors',
+  [paymentMethodValidation, ...donateDoctorsValidation],
+  formController.donateDoctors
+);
 
 // eSewa callbacks for Donate Doctors (no auth - called by eSewa redirect)
 router.get('/donate-doctors/esewa/success', formController.donateDoctorsEsewaSuccess);
 router.get('/donate-doctors/esewa/failure', formController.donateDoctorsEsewaFailure);
+
+// Nepal Payment callback (no auth)
+router.post('/donate-doctors/payment-callback', formController.donateDoctorsPaymentCallback);
 
 // Manual status check (useful if redirect was missed)
 router.post(

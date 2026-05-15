@@ -56,6 +56,110 @@ class EsewaGateway {
 const esewaGateway = new EsewaGateway();
 
 /**
+ * Nepal Payment gateway helper (mirrors bookPurchase.js)
+ */
+class FormPaymentGateway {
+  constructor() {
+    this.merchantId = process.env.NEPAL_PAYMENT_MERCHANT_ID || '7582';
+    this.merchantName = process.env.NEPAL_PAYMENT_MERCHANT_NAME || 'WebStudioNepal';
+    this.apiUsername = process.env.NEPAL_PAYMENT_API_USERNAME || 'WebStudioNepal';
+    this.apiPassword = process.env.NEPAL_PAYMENT_API_PASSWORD || 'WebStudioNepal#876';
+    this.secretKey = process.env.NEPAL_PAYMENT_SECRET_KEY || 'WebStudiol$KEY12';
+    this.baseUrl = process.env.NEPAL_PAYMENT_BASE_URL || 'https://apisandbox.nepalpayment.com';
+  }
+
+  generateSignature(data) {
+    const sortedKeys = Object.keys(data).sort();
+    const sortedData = {};
+    sortedKeys.forEach((key) => {
+      sortedData[key] = data[key];
+    });
+    const value = Object.values(sortedData).join('');
+    return crypto.createHmac('sha512', this.secretKey).update(value).digest('hex');
+  }
+
+  authHeader() {
+    const credentials = Buffer.from(`${this.apiUsername}:${this.apiPassword}`).toString('base64');
+    return {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/json'
+    };
+  }
+
+  async createPayment(amount, orderId) {
+    const payload = {
+      MerchantId: this.merchantId,
+      MerchantName: this.merchantName,
+      Amount: amount,
+      MerchantTxnId: orderId
+    };
+    payload.Signature = this.generateSignature(payload);
+    const response = await axios.post(`${this.baseUrl}/GetProcessId`, payload, {
+      headers: this.authHeader()
+    });
+    return response.data;
+  }
+
+  async checkTransactionFromGateway(merchantTxnId) {
+    try {
+      const payload = {
+        MerchantId: this.merchantId,
+        MerchantName: this.merchantName,
+        MerchantTxnId: merchantTxnId
+      };
+      payload.Signature = this.generateSignature(payload);
+      const response = await axios.post(`${this.baseUrl}/CheckTransactionStatus`, payload, {
+        headers: this.authHeader()
+      });
+      return response.data?.data || {};
+    } catch (error) {
+      console.error('Form Nepal Payment check status error:', error);
+      return {};
+    }
+  }
+}
+
+const formPaymentGateway = new FormPaymentGateway();
+
+/**
+ * Normalize payment method from request (default: esewa for backward compatibility).
+ */
+const normalizePaymentMethod = (reqBody = {}) => {
+  const raw =
+    reqBody.payment_method ??
+    reqBody.paymentMethod ??
+    reqBody.gateway ??
+    reqBody.payment_gateway ??
+    reqBody.paymentGateway ??
+    reqBody.method ??
+    reqBody.provider ??
+    'esewa';
+  const normalized = String(raw).toLowerCase().replace(/[\s_-]/g, '');
+  if (normalized === 'esewa' || normalized === 'esewaepay') return 'esewa';
+  if (normalized === 'nepalpayment' || normalized === 'nepalpay' || normalized === 'nepal') {
+    return 'nepalpayment';
+  }
+  return 'esewa';
+};
+
+const parseGatewayResponse = (payment) => {
+  try {
+    if (payment?.gateway_response) return JSON.parse(payment.gateway_response);
+  } catch (e) {
+    // ignore
+  }
+  return {};
+};
+
+const getNepalPaymentFormData = (orderId, totalAmount, responseUrl) => ({
+  MerchantId: formPaymentGateway.merchantId,
+  MerchantName: formPaymentGateway.merchantName,
+  Amount: totalAmount,
+  MerchantTxnId: orderId,
+  ResponseUrl: responseUrl
+});
+
+/**
  * Generate unique order ID for Kalki Sena membership payment.
  * Format: KM-{YYYYMMDD}-{SEQUENCE}-{RANDOM}
  */
@@ -154,68 +258,132 @@ const joinKalkiSena = async (req, res) => {
     };
 
     const totalAmount = KALKI_SENA_MEMBERSHIP_FEE;
+    const paymentMethod = normalizePaymentMethod(req.body);
     const orderId = await generateMembershipOrderId();
-
-    // eSewa requires transaction_uuid to be alphanumeric and hyphen(-) only.
-    const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
-    const signedFieldNames = 'total_amount,transaction_uuid,product_code';
-
     const appUrl = process.env.APP_URL || 'http://localhost:3000';
-    const successUrl =
-      process.env.ESEWA_JOIN_KALKI_SENA_SUCCESS_URL ||
-      `${appUrl}/api/form/join-kalki-sena/esewa/success`;
-    const failureUrl =
-      process.env.ESEWA_JOIN_KALKI_SENA_FAILURE_URL ||
-      `${appUrl}/api/form/join-kalki-sena/esewa/failure`;
 
-    const esewaPayload = {
-      amount: String(totalAmount),
-      tax_amount: '0',
-      total_amount: String(totalAmount),
-      transaction_uuid: transactionUuid,
-      product_code: esewaGateway.productCode,
-      product_service_charge: '0',
-      product_delivery_charge: '0',
-      success_url: successUrl,
-      failure_url: failureUrl,
-      signed_field_names: signedFieldNames
-    };
+    if (paymentMethod === 'esewa') {
+      const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
+      const signedFieldNames = 'total_amount,transaction_uuid,product_code';
+      const successUrl =
+        process.env.ESEWA_JOIN_KALKI_SENA_SUCCESS_URL ||
+        `${appUrl}/api/form/join-kalki-sena/esewa/success`;
+      const failureUrl =
+        process.env.ESEWA_JOIN_KALKI_SENA_FAILURE_URL ||
+        `${appUrl}/api/form/join-kalki-sena/esewa/failure`;
 
-    const { signature, message } = esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
-    esewaPayload.signature = signature;
+      const esewaPayload = {
+        amount: String(totalAmount),
+        tax_amount: '0',
+        total_amount: String(totalAmount),
+        transaction_uuid: transactionUuid,
+        product_code: esewaGateway.productCode,
+        product_service_charge: '0',
+        product_delivery_charge: '0',
+        success_url: successUrl,
+        failure_url: failureUrl,
+        signed_field_names: signedFieldNames
+      };
+
+      const { signature, message } = esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
+      esewaPayload.signature = signature;
+
+      const payment = await Payment.create({
+        order_id: transactionUuid,
+        amount: totalAmount,
+        process_id: null,
+        status: 'INITIATED',
+        gateway_response: JSON.stringify({
+          gateway: 'ESEWA',
+          purpose: 'JOIN_KALKI_SENA',
+          signature_message: message,
+          payment_request: esewaPayload,
+          form_data: formData
+        })
+      });
+
+      console.log('[JOIN_KALKI_SENA] eSewa payment initialized:', {
+        order_id: transactionUuid,
+        payment_id: payment.id,
+        amount: totalAmount
+      });
+
+      return res.status(200).json({
+        success: true,
+        message:
+          'eSewa payment initialized for Kalki Sena membership. Please complete the payment to confirm your registration.',
+        data: {
+          gateway: 'ESEWA',
+          payment_method: 'esewa',
+          paymentMethod: 'esewa',
+          purpose: 'JOIN_KALKI_SENA',
+          order_id: transactionUuid,
+          amount: totalAmount,
+          currency: 'NPR',
+          payment_url: esewaGateway.formUrl,
+          form_data: esewaPayload,
+          membership: {
+            name: 'Kalkiism Research Center - Kalki Sena Membership',
+            fee: totalAmount,
+            currency: 'NPR'
+          }
+        }
+      });
+    }
+
+    const paymentResponse = await formPaymentGateway.createPayment(String(totalAmount), orderId);
+    if (!paymentResponse.code || paymentResponse.code !== '0') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment initialization failed',
+        error: paymentResponse.message || 'Unable to initialize Nepal Payment'
+      });
+    }
+
+    const processId = paymentResponse.data?.ProcessId || null;
+    const responseUrl =
+      process.env.NEPAL_PAYMENT_JOIN_KALKI_SENA_RESPONSE_URL ||
+      `${appUrl}/api/form/join-kalki-sena/payment-callback`;
+    const paymentUrl =
+      process.env.NEPAL_PAYMENT_GATEWAY_URL ||
+      'https://gatewaysandbox.nepalpayment.com/Payment/Index';
 
     const payment = await Payment.create({
-      order_id: transactionUuid,
+      order_id: orderId,
       amount: totalAmount,
-      process_id: null,
+      process_id: processId,
       status: 'INITIATED',
       gateway_response: JSON.stringify({
-        gateway: 'ESEWA',
+        gateway: 'NEPALPAYMENT',
         purpose: 'JOIN_KALKI_SENA',
-        signature_message: message,
-        payment_request: esewaPayload,
+        payment_response: paymentResponse,
         form_data: formData
       })
     });
 
-    console.log('[JOIN_KALKI_SENA] eSewa payment initialized:', {
-      order_id: transactionUuid,
+    console.log('[JOIN_KALKI_SENA] Nepal Payment initialized:', {
+      order_id: orderId,
       payment_id: payment.id,
       amount: totalAmount
     });
 
     return res.status(200).json({
       success: true,
-      message: 'eSewa payment initialized for Kalki Sena membership. Please complete the payment to confirm your registration.',
+      message:
+        'Nepal Payment initialized for Kalki Sena membership. Please complete the payment to confirm your registration.',
       data: {
-        gateway: 'ESEWA',
-        payment_method: 'esewa',
+        gateway: 'NEPALPAYMENT',
+        payment_method: 'nepalpayment',
+        paymentMethod: 'nepalpayment',
         purpose: 'JOIN_KALKI_SENA',
-        order_id: transactionUuid,
+        order_id: orderId,
         amount: totalAmount,
         currency: 'NPR',
-        payment_url: esewaGateway.formUrl,
-        form_data: esewaPayload,
+        payment_url: paymentUrl,
+        form_data: {
+          ...getNepalPaymentFormData(orderId, totalAmount, responseUrl),
+          ProcessId: processId
+        },
         membership: {
           name: 'Kalkiism Research Center - Kalki Sena Membership',
           fee: totalAmount,
@@ -237,31 +405,53 @@ const joinKalkiSena = async (req, res) => {
  * Helper: persist final state of a Kalki Sena membership payment and
  * create the JoinKalkisenaClinic record on success (idempotent).
  */
-const finalizeJoinKalkiSenaPayment = async ({ payment, decoded, signatureValid, statusApiResult }) => {
-  const finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
-  const paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+const finalizeJoinKalkiSenaPayment = async ({
+  payment,
+  gateway,
+  decoded,
+  signatureValid,
+  statusApiResult,
+  nepalStatus
+}) => {
+  const gatewayResponseData = parseGatewayResponse(payment);
+  const resolvedGateway = (gateway || gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
-  let gatewayResponseData = {};
-  try {
-    if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-  } catch (e) {
-    gatewayResponseData = {};
+  let paymentStatus;
+  let isSuccess = false;
+  let finalStatus = null;
+
+  if (resolvedGateway === 'NEPALPAYMENT') {
+    paymentStatus = nepalStatus?.Status || payment.status || 'UNKNOWN';
+    isSuccess = paymentStatus === 'SUCCESS';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'NEPALPAYMENT',
+        purpose: 'JOIN_KALKI_SENA',
+        payment_response: nepalStatus,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
+  } else {
+    finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
+    paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+    isSuccess = finalStatus === 'COMPLETE';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'ESEWA',
+        purpose: 'JOIN_KALKI_SENA',
+        response_payload: decoded,
+        signature_valid: signatureValid,
+        status_api: statusApiResult,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
   }
 
-  await payment.update({
-    status: paymentStatus,
-    gateway_response: JSON.stringify({
-      gateway: 'ESEWA',
-      purpose: 'JOIN_KALKI_SENA',
-      response_payload: decoded,
-      signature_valid: signatureValid,
-      status_api: statusApiResult,
-      form_data: gatewayResponseData.form_data || null
-    }),
-    updated_at: new Date()
-  });
-
-  if (finalStatus !== 'COMPLETE') {
+  if (!isSuccess) {
     return { paymentStatus, membership: null, finalStatus };
   }
 
@@ -351,6 +541,7 @@ const joinKalkiSenaEsewaSuccess = async (req, res) => {
 
     const { paymentStatus, membership, finalStatus } = await finalizeJoinKalkiSenaPayment({
       payment,
+      gateway: 'ESEWA',
       decoded,
       signatureValid,
       statusApiResult
@@ -444,6 +635,39 @@ const joinKalkiSenaEsewaFailure = async (req, res) => {
 };
 
 /**
+ * Nepal Payment callback for Kalki Sena membership (POST, no auth)
+ */
+const joinKalkiSenaPaymentCallback = async (req, res) => {
+  try {
+    const { MerchantTxnId } = req.body;
+    if (!MerchantTxnId) {
+      return res.status(400).json({ success: false, message: 'MerchantTxnId is required' });
+    }
+
+    const payment = await Payment.findOne({ where: { order_id: MerchantTxnId } });
+    if (!payment) {
+      return res.status(404).json({ success: false, message: 'Payment record not found' });
+    }
+
+    const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(MerchantTxnId);
+    await finalizeJoinKalkiSenaPayment({
+      payment,
+      gateway: 'NEPALPAYMENT',
+      nepalStatus
+    });
+
+    return res.status(200).send('received');
+  } catch (error) {
+    console.error('Join Kalki Sena Nepal Payment callback error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error processing Nepal Payment callback for Kalki Sena membership',
+      error: error.message
+    });
+  }
+};
+
+/**
  * Check Kalki Sena membership payment status by order_id.
  * Useful for the frontend to verify state if the redirect was missed.
  */
@@ -466,15 +690,32 @@ const checkJoinKalkiSenaPaymentStatus = async (req, res) => {
       });
     }
 
-    let gatewayResponseData = {};
-    try {
-      if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-    } catch (e) {
-      gatewayResponseData = {};
-    }
+    const gatewayResponseData = parseGatewayResponse(payment);
+    const gateway = (gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
-    // If still pending, ask eSewa for the authoritative status and finalize.
     if (payment.status === 'INITIATED' || payment.status === 'PENDING') {
+      if (gateway === 'NEPALPAYMENT') {
+        const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(payment.order_id);
+        const { paymentStatus, membership } = await finalizeJoinKalkiSenaPayment({
+          payment,
+          gateway: 'NEPALPAYMENT',
+          nepalStatus
+        });
+
+        return res.status(200).json({
+          success: paymentStatus === 'SUCCESS',
+          message: `Kalki Sena membership payment status: ${paymentStatus}`,
+          data: {
+            order_id: payment.order_id,
+            payment_id: payment.id,
+            payment_status: paymentStatus,
+            gateway: 'NEPALPAYMENT',
+            gateway_status: nepalStatus,
+            membership: membership ? membership.toJSON() : null
+          }
+        });
+      }
+
       let statusApiResult = null;
       try {
         statusApiResult = await esewaGateway.checkStatus({
@@ -495,6 +736,7 @@ const checkJoinKalkiSenaPaymentStatus = async (req, res) => {
 
       const { paymentStatus, membership } = await finalizeJoinKalkiSenaPayment({
         payment,
+        gateway: 'ESEWA',
         decoded,
         signatureValid: false,
         statusApiResult
@@ -507,6 +749,7 @@ const checkJoinKalkiSenaPaymentStatus = async (req, res) => {
           order_id: payment.order_id,
           payment_id: payment.id,
           payment_status: paymentStatus,
+          gateway: 'ESEWA',
           status_api: statusApiResult,
           membership: membership ? membership.toJSON() : null
         }
@@ -631,75 +874,139 @@ const donateAbolishDowry = async (req, res) => {
     };
 
     const totalAmount = amountValue;
+    const paymentMethod = normalizePaymentMethod(req.body);
     const orderId = await generateAbolishDowryOrderId();
-
-    // eSewa requires transaction_uuid to be alphanumeric and hyphen only.
-    const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
-    const signedFieldNames = 'total_amount,transaction_uuid,product_code';
-
     const appUrl = process.env.APP_URL || 'http://localhost:3000';
-    const successUrl =
-      process.env.ESEWA_DONATE_ABOLISH_DOWRY_SUCCESS_URL ||
-      `${appUrl}/api/form/donate-abolish-dowry/esewa/success`;
-    const failureUrl =
-      process.env.ESEWA_DONATE_ABOLISH_DOWRY_FAILURE_URL ||
-      `${appUrl}/api/form/donate-abolish-dowry/esewa/failure`;
 
-    const esewaPayload = {
-      amount: String(totalAmount),
-      tax_amount: '0',
-      total_amount: String(totalAmount),
-      transaction_uuid: transactionUuid,
-      product_code: esewaGateway.productCode,
-      product_service_charge: '0',
-      product_delivery_charge: '0',
-      success_url: successUrl,
-      failure_url: failureUrl,
-      signed_field_names: signedFieldNames
+    const receiver = {
+      name: 'Kalkiism Research and Training Center',
+      bank: 'Nabil Bank',
+      branch: 'Kuleshwor',
+      account_number: '03801017501357'
     };
 
-    const { signature, message: signatureMessage } =
-      esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
-    esewaPayload.signature = signature;
+    if (paymentMethod === 'esewa') {
+      const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
+      const signedFieldNames = 'total_amount,transaction_uuid,product_code';
+      const successUrl =
+        process.env.ESEWA_DONATE_ABOLISH_DOWRY_SUCCESS_URL ||
+        `${appUrl}/api/form/donate-abolish-dowry/esewa/success`;
+      const failureUrl =
+        process.env.ESEWA_DONATE_ABOLISH_DOWRY_FAILURE_URL ||
+        `${appUrl}/api/form/donate-abolish-dowry/esewa/failure`;
+
+      const esewaPayload = {
+        amount: String(totalAmount),
+        tax_amount: '0',
+        total_amount: String(totalAmount),
+        transaction_uuid: transactionUuid,
+        product_code: esewaGateway.productCode,
+        product_service_charge: '0',
+        product_delivery_charge: '0',
+        success_url: successUrl,
+        failure_url: failureUrl,
+        signed_field_names: signedFieldNames
+      };
+
+      const { signature, message: signatureMessage } = esewaGateway.signatureFromFields(
+        esewaPayload,
+        signedFieldNames
+      );
+      esewaPayload.signature = signature;
+
+      const payment = await Payment.create({
+        order_id: transactionUuid,
+        amount: totalAmount,
+        process_id: null,
+        status: 'INITIATED',
+        gateway_response: JSON.stringify({
+          gateway: 'ESEWA',
+          purpose: 'DONATE_ABOLISH_DOWRY',
+          signature_message: signatureMessage,
+          payment_request: esewaPayload,
+          form_data: formData
+        })
+      });
+
+      console.log('[DONATE_ABOLISH_DOWRY] eSewa payment initialized:', {
+        order_id: transactionUuid,
+        payment_id: payment.id,
+        amount: totalAmount
+      });
+
+      return res.status(200).json({
+        success: true,
+        message:
+          'eSewa payment initialized for Donate to Abolish Dowry. Please complete the payment to confirm your donation.',
+        data: {
+          gateway: 'ESEWA',
+          payment_method: 'esewa',
+          paymentMethod: 'esewa',
+          purpose: 'DONATE_ABOLISH_DOWRY',
+          order_id: transactionUuid,
+          amount: totalAmount,
+          currency: 'NPR',
+          payment_url: esewaGateway.formUrl,
+          form_data: esewaPayload,
+          receiver
+        }
+      });
+    }
+
+    const paymentResponse = await formPaymentGateway.createPayment(String(totalAmount), orderId);
+    if (!paymentResponse.code || paymentResponse.code !== '0') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment initialization failed',
+        error: paymentResponse.message || 'Unable to initialize Nepal Payment'
+      });
+    }
+
+    const processId = paymentResponse.data?.ProcessId || null;
+    const responseUrl =
+      process.env.NEPAL_PAYMENT_DONATE_ABOLISH_DOWRY_RESPONSE_URL ||
+      `${appUrl}/api/form/donate-abolish-dowry/payment-callback`;
+    const paymentUrl =
+      process.env.NEPAL_PAYMENT_GATEWAY_URL ||
+      'https://gatewaysandbox.nepalpayment.com/Payment/Index';
 
     const payment = await Payment.create({
-      order_id: transactionUuid,
+      order_id: orderId,
       amount: totalAmount,
-      process_id: null,
+      process_id: processId,
       status: 'INITIATED',
       gateway_response: JSON.stringify({
-        gateway: 'ESEWA',
+        gateway: 'NEPALPAYMENT',
         purpose: 'DONATE_ABOLISH_DOWRY',
-        signature_message: signatureMessage,
-        payment_request: esewaPayload,
+        payment_response: paymentResponse,
         form_data: formData
       })
     });
 
-    console.log('[DONATE_ABOLISH_DOWRY] eSewa payment initialized:', {
-      order_id: transactionUuid,
+    console.log('[DONATE_ABOLISH_DOWRY] Nepal Payment initialized:', {
+      order_id: orderId,
       payment_id: payment.id,
       amount: totalAmount
     });
 
     return res.status(200).json({
       success: true,
-      message: 'eSewa payment initialized for Donate to Abolish Dowry. Please complete the payment to confirm your donation.',
+      message:
+        'Nepal Payment initialized for Donate to Abolish Dowry. Please complete the payment to confirm your donation.',
       data: {
-        gateway: 'ESEWA',
-        payment_method: 'esewa',
+        gateway: 'NEPALPAYMENT',
+        payment_method: 'nepalpayment',
+        paymentMethod: 'nepalpayment',
         purpose: 'DONATE_ABOLISH_DOWRY',
-        order_id: transactionUuid,
+        order_id: orderId,
         amount: totalAmount,
         currency: 'NPR',
-        payment_url: esewaGateway.formUrl,
-        form_data: esewaPayload,
-        receiver: {
-          name: 'Kalkiism Research and Training Center',
-          bank: 'Nabil Bank',
-          branch: 'Kuleshwor',
-          account_number: '03801017501357'
-        }
+        payment_url: paymentUrl,
+        form_data: {
+          ...getNepalPaymentFormData(orderId, totalAmount, responseUrl),
+          ProcessId: processId
+        },
+        receiver
       }
     });
   } catch (error) {
@@ -716,31 +1023,53 @@ const donateAbolishDowry = async (req, res) => {
  * Helper: finalize the donation payment and create the donation
  * record once eSewa confirms COMPLETE. Idempotent.
  */
-const finalizeDonateAbolishDowryPayment = async ({ payment, decoded, signatureValid, statusApiResult }) => {
-  const finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
-  const paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+const finalizeDonateAbolishDowryPayment = async ({
+  payment,
+  gateway,
+  decoded,
+  signatureValid,
+  statusApiResult,
+  nepalStatus
+}) => {
+  const gatewayResponseData = parseGatewayResponse(payment);
+  const resolvedGateway = (gateway || gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
-  let gatewayResponseData = {};
-  try {
-    if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-  } catch (e) {
-    gatewayResponseData = {};
+  let paymentStatus;
+  let isSuccess = false;
+  let finalStatus = null;
+
+  if (resolvedGateway === 'NEPALPAYMENT') {
+    paymentStatus = nepalStatus?.Status || payment.status || 'UNKNOWN';
+    isSuccess = paymentStatus === 'SUCCESS';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'NEPALPAYMENT',
+        purpose: 'DONATE_ABOLISH_DOWRY',
+        payment_response: nepalStatus,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
+  } else {
+    finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
+    paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+    isSuccess = finalStatus === 'COMPLETE';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'ESEWA',
+        purpose: 'DONATE_ABOLISH_DOWRY',
+        response_payload: decoded,
+        signature_valid: signatureValid,
+        status_api: statusApiResult,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
   }
 
-  await payment.update({
-    status: paymentStatus,
-    gateway_response: JSON.stringify({
-      gateway: 'ESEWA',
-      purpose: 'DONATE_ABOLISH_DOWRY',
-      response_payload: decoded,
-      signature_valid: signatureValid,
-      status_api: statusApiResult,
-      form_data: gatewayResponseData.form_data || null
-    }),
-    updated_at: new Date()
-  });
-
-  if (finalStatus !== 'COMPLETE') {
+  if (!isSuccess) {
     return { paymentStatus, donation: null, finalStatus };
   }
 
@@ -819,6 +1148,7 @@ const donateAbolishDowryEsewaSuccess = async (req, res) => {
 
     const { paymentStatus, donation, finalStatus } = await finalizeDonateAbolishDowryPayment({
       payment,
+      gateway: 'ESEWA',
       decoded,
       signatureValid,
       statusApiResult
@@ -912,6 +1242,39 @@ const donateAbolishDowryEsewaFailure = async (req, res) => {
 };
 
 /**
+ * Nepal Payment callback for Donate Abolish Dowry (POST, no auth)
+ */
+const donateAbolishDowryPaymentCallback = async (req, res) => {
+  try {
+    const { MerchantTxnId } = req.body;
+    if (!MerchantTxnId) {
+      return res.status(400).json({ success: false, message: 'MerchantTxnId is required' });
+    }
+
+    const payment = await Payment.findOne({ where: { order_id: MerchantTxnId } });
+    if (!payment) {
+      return res.status(404).json({ success: false, message: 'Payment record not found' });
+    }
+
+    const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(MerchantTxnId);
+    await finalizeDonateAbolishDowryPayment({
+      payment,
+      gateway: 'NEPALPAYMENT',
+      nepalStatus
+    });
+
+    return res.status(200).send('received');
+  } catch (error) {
+    console.error('Donate Abolish Dowry Nepal Payment callback error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error processing Nepal Payment callback for Donate Abolish Dowry',
+      error: error.message
+    });
+  }
+};
+
+/**
  * Check Donate Abolish Dowry payment status by order_id.
  */
 const checkDonateAbolishDowryPaymentStatus = async (req, res) => {
@@ -933,14 +1296,32 @@ const checkDonateAbolishDowryPaymentStatus = async (req, res) => {
       });
     }
 
-    let gatewayResponseData = {};
-    try {
-      if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-    } catch (e) {
-      gatewayResponseData = {};
-    }
+    const gatewayResponseData = parseGatewayResponse(payment);
+    const gateway = (gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
     if (payment.status === 'INITIATED' || payment.status === 'PENDING') {
+      if (gateway === 'NEPALPAYMENT') {
+        const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(payment.order_id);
+        const { paymentStatus, donation } = await finalizeDonateAbolishDowryPayment({
+          payment,
+          gateway: 'NEPALPAYMENT',
+          nepalStatus
+        });
+
+        return res.status(200).json({
+          success: paymentStatus === 'SUCCESS',
+          message: `Donate Abolish Dowry payment status: ${paymentStatus}`,
+          data: {
+            order_id: payment.order_id,
+            payment_id: payment.id,
+            payment_status: paymentStatus,
+            gateway: 'NEPALPAYMENT',
+            gateway_status: nepalStatus,
+            donation: donation ? donation.toJSON() : null
+          }
+        });
+      }
+
       let statusApiResult = null;
       try {
         statusApiResult = await esewaGateway.checkStatus({
@@ -961,6 +1342,7 @@ const checkDonateAbolishDowryPaymentStatus = async (req, res) => {
 
       const { paymentStatus, donation } = await finalizeDonateAbolishDowryPayment({
         payment,
+        gateway: 'ESEWA',
         decoded,
         signatureValid: false,
         statusApiResult
@@ -973,6 +1355,7 @@ const checkDonateAbolishDowryPaymentStatus = async (req, res) => {
           order_id: payment.order_id,
           payment_id: payment.id,
           payment_status: paymentStatus,
+          gateway: 'ESEWA',
           status_api: statusApiResult,
           donation: donation ? donation.toJSON() : null
         }
@@ -1109,75 +1492,139 @@ const donateDoctors = async (req, res) => {
     };
 
     const totalAmount = amountValue;
+    const paymentMethod = normalizePaymentMethod(req.body);
     const orderId = await generateDonateDoctorsOrderId();
-
-    // eSewa requires transaction_uuid to be alphanumeric and hyphen only.
-    const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
-    const signedFieldNames = 'total_amount,transaction_uuid,product_code';
-
     const appUrl = process.env.APP_URL || 'http://localhost:3000';
-    const successUrl =
-      process.env.ESEWA_DONATE_DOCTORS_SUCCESS_URL ||
-      `${appUrl}/api/form/donate-doctors/esewa/success`;
-    const failureUrl =
-      process.env.ESEWA_DONATE_DOCTORS_FAILURE_URL ||
-      `${appUrl}/api/form/donate-doctors/esewa/failure`;
 
-    const esewaPayload = {
-      amount: String(totalAmount),
-      tax_amount: '0',
-      total_amount: String(totalAmount),
-      transaction_uuid: transactionUuid,
-      product_code: esewaGateway.productCode,
-      product_service_charge: '0',
-      product_delivery_charge: '0',
-      success_url: successUrl,
-      failure_url: failureUrl,
-      signed_field_names: signedFieldNames
+    const receiver = {
+      name: 'Kalkiism Research and Training Center',
+      bank: 'Nabil Bank',
+      branch: 'Kuleshwor',
+      account_number: '03801017501357'
     };
 
-    const { signature, message: signatureMessage } =
-      esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
-    esewaPayload.signature = signature;
+    if (paymentMethod === 'esewa') {
+      const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
+      const signedFieldNames = 'total_amount,transaction_uuid,product_code';
+      const successUrl =
+        process.env.ESEWA_DONATE_DOCTORS_SUCCESS_URL ||
+        `${appUrl}/api/form/donate-doctors/esewa/success`;
+      const failureUrl =
+        process.env.ESEWA_DONATE_DOCTORS_FAILURE_URL ||
+        `${appUrl}/api/form/donate-doctors/esewa/failure`;
+
+      const esewaPayload = {
+        amount: String(totalAmount),
+        tax_amount: '0',
+        total_amount: String(totalAmount),
+        transaction_uuid: transactionUuid,
+        product_code: esewaGateway.productCode,
+        product_service_charge: '0',
+        product_delivery_charge: '0',
+        success_url: successUrl,
+        failure_url: failureUrl,
+        signed_field_names: signedFieldNames
+      };
+
+      const { signature, message: signatureMessage } = esewaGateway.signatureFromFields(
+        esewaPayload,
+        signedFieldNames
+      );
+      esewaPayload.signature = signature;
+
+      const payment = await Payment.create({
+        order_id: transactionUuid,
+        amount: totalAmount,
+        process_id: null,
+        status: 'INITIATED',
+        gateway_response: JSON.stringify({
+          gateway: 'ESEWA',
+          purpose: 'DONATE_DOCTORS',
+          signature_message: signatureMessage,
+          payment_request: esewaPayload,
+          form_data: formData
+        })
+      });
+
+      console.log('[DONATE_DOCTORS] eSewa payment initialized:', {
+        order_id: transactionUuid,
+        payment_id: payment.id,
+        amount: totalAmount
+      });
+
+      return res.status(200).json({
+        success: true,
+        message:
+          'eSewa payment initialized for Donate to Doctors. Please complete the payment to confirm your donation.',
+        data: {
+          gateway: 'ESEWA',
+          payment_method: 'esewa',
+          paymentMethod: 'esewa',
+          purpose: 'DONATE_DOCTORS',
+          order_id: transactionUuid,
+          amount: totalAmount,
+          currency: 'NPR',
+          payment_url: esewaGateway.formUrl,
+          form_data: esewaPayload,
+          receiver
+        }
+      });
+    }
+
+    const paymentResponse = await formPaymentGateway.createPayment(String(totalAmount), orderId);
+    if (!paymentResponse.code || paymentResponse.code !== '0') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment initialization failed',
+        error: paymentResponse.message || 'Unable to initialize Nepal Payment'
+      });
+    }
+
+    const processId = paymentResponse.data?.ProcessId || null;
+    const responseUrl =
+      process.env.NEPAL_PAYMENT_DONATE_DOCTORS_RESPONSE_URL ||
+      `${appUrl}/api/form/donate-doctors/payment-callback`;
+    const paymentUrl =
+      process.env.NEPAL_PAYMENT_GATEWAY_URL ||
+      'https://gatewaysandbox.nepalpayment.com/Payment/Index';
 
     const payment = await Payment.create({
-      order_id: transactionUuid,
+      order_id: orderId,
       amount: totalAmount,
-      process_id: null,
+      process_id: processId,
       status: 'INITIATED',
       gateway_response: JSON.stringify({
-        gateway: 'ESEWA',
+        gateway: 'NEPALPAYMENT',
         purpose: 'DONATE_DOCTORS',
-        signature_message: signatureMessage,
-        payment_request: esewaPayload,
+        payment_response: paymentResponse,
         form_data: formData
       })
     });
 
-    console.log('[DONATE_DOCTORS] eSewa payment initialized:', {
-      order_id: transactionUuid,
+    console.log('[DONATE_DOCTORS] Nepal Payment initialized:', {
+      order_id: orderId,
       payment_id: payment.id,
       amount: totalAmount
     });
 
     return res.status(200).json({
       success: true,
-      message: 'eSewa payment initialized for Donate to Doctors. Please complete the payment to confirm your donation.',
+      message:
+        'Nepal Payment initialized for Donate to Doctors. Please complete the payment to confirm your donation.',
       data: {
-        gateway: 'ESEWA',
-        payment_method: 'esewa',
+        gateway: 'NEPALPAYMENT',
+        payment_method: 'nepalpayment',
+        paymentMethod: 'nepalpayment',
         purpose: 'DONATE_DOCTORS',
-        order_id: transactionUuid,
+        order_id: orderId,
         amount: totalAmount,
         currency: 'NPR',
-        payment_url: esewaGateway.formUrl,
-        form_data: esewaPayload,
-        receiver: {
-          name: 'Kalkiism Research and Training Center',
-          bank: 'Nabil Bank',
-          branch: 'Kuleshwor',
-          account_number: '03801017501357'
-        }
+        payment_url: paymentUrl,
+        form_data: {
+          ...getNepalPaymentFormData(orderId, totalAmount, responseUrl),
+          ProcessId: processId
+        },
+        receiver
       }
     });
   } catch (error) {
@@ -1194,31 +1641,53 @@ const donateDoctors = async (req, res) => {
  * Helper: finalize the Donate Doctors payment and create the donation
  * row when eSewa confirms COMPLETE. Idempotent.
  */
-const finalizeDonateDoctorsPayment = async ({ payment, decoded, signatureValid, statusApiResult }) => {
-  const finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
-  const paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+const finalizeDonateDoctorsPayment = async ({
+  payment,
+  gateway,
+  decoded,
+  signatureValid,
+  statusApiResult,
+  nepalStatus
+}) => {
+  const gatewayResponseData = parseGatewayResponse(payment);
+  const resolvedGateway = (gateway || gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
-  let gatewayResponseData = {};
-  try {
-    if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-  } catch (e) {
-    gatewayResponseData = {};
+  let paymentStatus;
+  let isSuccess = false;
+  let finalStatus = null;
+
+  if (resolvedGateway === 'NEPALPAYMENT') {
+    paymentStatus = nepalStatus?.Status || payment.status || 'UNKNOWN';
+    isSuccess = paymentStatus === 'SUCCESS';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'NEPALPAYMENT',
+        purpose: 'DONATE_DOCTORS',
+        payment_response: nepalStatus,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
+  } else {
+    finalStatus = statusApiResult?.status || decoded?.status || 'UNKNOWN';
+    paymentStatus = finalStatus === 'COMPLETE' ? 'SUCCESS' : finalStatus;
+    isSuccess = finalStatus === 'COMPLETE';
+    await payment.update({
+      status: paymentStatus,
+      gateway_response: JSON.stringify({
+        gateway: 'ESEWA',
+        purpose: 'DONATE_DOCTORS',
+        response_payload: decoded,
+        signature_valid: signatureValid,
+        status_api: statusApiResult,
+        form_data: gatewayResponseData.form_data || null
+      }),
+      updated_at: new Date()
+    });
   }
 
-  await payment.update({
-    status: paymentStatus,
-    gateway_response: JSON.stringify({
-      gateway: 'ESEWA',
-      purpose: 'DONATE_DOCTORS',
-      response_payload: decoded,
-      signature_valid: signatureValid,
-      status_api: statusApiResult,
-      form_data: gatewayResponseData.form_data || null
-    }),
-    updated_at: new Date()
-  });
-
-  if (finalStatus !== 'COMPLETE') {
+  if (!isSuccess) {
     return { paymentStatus, donation: null, finalStatus };
   }
 
@@ -1297,6 +1766,7 @@ const donateDoctorsEsewaSuccess = async (req, res) => {
 
     const { paymentStatus, donation, finalStatus } = await finalizeDonateDoctorsPayment({
       payment,
+      gateway: 'ESEWA',
       decoded,
       signatureValid,
       statusApiResult
@@ -1390,6 +1860,39 @@ const donateDoctorsEsewaFailure = async (req, res) => {
 };
 
 /**
+ * Nepal Payment callback for Donate Doctors (POST, no auth)
+ */
+const donateDoctorsPaymentCallback = async (req, res) => {
+  try {
+    const { MerchantTxnId } = req.body;
+    if (!MerchantTxnId) {
+      return res.status(400).json({ success: false, message: 'MerchantTxnId is required' });
+    }
+
+    const payment = await Payment.findOne({ where: { order_id: MerchantTxnId } });
+    if (!payment) {
+      return res.status(404).json({ success: false, message: 'Payment record not found' });
+    }
+
+    const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(MerchantTxnId);
+    await finalizeDonateDoctorsPayment({
+      payment,
+      gateway: 'NEPALPAYMENT',
+      nepalStatus
+    });
+
+    return res.status(200).send('received');
+  } catch (error) {
+    console.error('Donate Doctors Nepal Payment callback error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error processing Nepal Payment callback for Donate to Doctors',
+      error: error.message
+    });
+  }
+};
+
+/**
  * Check Donate Doctors payment status by order_id.
  */
 const checkDonateDoctorsPaymentStatus = async (req, res) => {
@@ -1411,14 +1914,32 @@ const checkDonateDoctorsPaymentStatus = async (req, res) => {
       });
     }
 
-    let gatewayResponseData = {};
-    try {
-      if (payment.gateway_response) gatewayResponseData = JSON.parse(payment.gateway_response);
-    } catch (e) {
-      gatewayResponseData = {};
-    }
+    const gatewayResponseData = parseGatewayResponse(payment);
+    const gateway = (gatewayResponseData.gateway || 'ESEWA').toUpperCase();
 
     if (payment.status === 'INITIATED' || payment.status === 'PENDING') {
+      if (gateway === 'NEPALPAYMENT') {
+        const nepalStatus = await formPaymentGateway.checkTransactionFromGateway(payment.order_id);
+        const { paymentStatus, donation } = await finalizeDonateDoctorsPayment({
+          payment,
+          gateway: 'NEPALPAYMENT',
+          nepalStatus
+        });
+
+        return res.status(200).json({
+          success: paymentStatus === 'SUCCESS',
+          message: `Donate Doctors payment status: ${paymentStatus}`,
+          data: {
+            order_id: payment.order_id,
+            payment_id: payment.id,
+            payment_status: paymentStatus,
+            gateway: 'NEPALPAYMENT',
+            gateway_status: nepalStatus,
+            donation: donation ? donation.toJSON() : null
+          }
+        });
+      }
+
       let statusApiResult = null;
       try {
         statusApiResult = await esewaGateway.checkStatus({
@@ -1439,6 +1960,7 @@ const checkDonateDoctorsPaymentStatus = async (req, res) => {
 
       const { paymentStatus, donation } = await finalizeDonateDoctorsPayment({
         payment,
+        gateway: 'ESEWA',
         decoded,
         signatureValid: false,
         statusApiResult
@@ -1451,6 +1973,7 @@ const checkDonateDoctorsPaymentStatus = async (req, res) => {
           order_id: payment.order_id,
           payment_id: payment.id,
           payment_status: paymentStatus,
+          gateway: 'ESEWA',
           status_api: statusApiResult,
           donation: donation ? donation.toJSON() : null
         }
@@ -1632,14 +2155,17 @@ module.exports = {
   joinKalkiSena,
   joinKalkiSenaEsewaSuccess,
   joinKalkiSenaEsewaFailure,
+  joinKalkiSenaPaymentCallback,
   checkJoinKalkiSenaPaymentStatus,
   donateAbolishDowry,
   donateAbolishDowryEsewaSuccess,
   donateAbolishDowryEsewaFailure,
+  donateAbolishDowryPaymentCallback,
   checkDonateAbolishDowryPaymentStatus,
   donateDoctors,
   donateDoctorsEsewaSuccess,
   donateDoctorsEsewaFailure,
+  donateDoctorsPaymentCallback,
   checkDonateDoctorsPaymentStatus,
   registerCoaching,
   registerHostel
