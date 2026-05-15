@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { body, param, query } = require('express-validator');
 const bookPurchaseController = require('../controllers/bookPurchase');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 /**
  * Validation rules
@@ -113,38 +113,12 @@ const purchaseBookValidation = [
   body('book_id')
     .notEmpty().withMessage('Book ID is required')
     .isInt().withMessage('Book ID must be an integer'),
+  body('clinic_id')
+    .notEmpty().withMessage('clinic_id is required (pickup location)')
+    .isInt().withMessage('clinic_id must be an integer'),
   body('quantity')
     .optional()
     .isInt({ min: 1 }).withMessage('Quantity must be a positive integer'),
-  body('address_id')
-    .optional({ nullable: true, checkFalsy: true })
-    .isInt().withMessage('Address ID must be an integer'),
-  body('address')
-    .optional({ nullable: true, checkFalsy: true })
-    .trim()
-    .isLength({ min: 5, max: 500 }).withMessage('Address must be between 5 and 500 characters')
-    .custom((value, { req }) => {
-      if (value && req.body.address_id) {
-        throw new Error('Provide either address_id or address, not both');
-      }
-      return true;
-    }),
-  body('city')
-    .optional()
-    .trim()
-    .isLength({ max: 100 }).withMessage('City must be less than 100 characters'),
-  body('state')
-    .optional()
-    .trim()
-    .isLength({ max: 100 }).withMessage('State must be less than 100 characters'),
-  body('postal_code')
-    .optional()
-    .trim()
-    .isLength({ max: 20 }).withMessage('Postal code must be less than 20 characters'),
-  body('country')
-    .optional()
-    .trim()
-    .isLength({ max: 100 }).withMessage('Country must be less than 100 characters'),
   body('phone_number')
     .optional()
     .trim()
@@ -166,7 +140,49 @@ const getPurchaseHistoryValidation = [
   query('status')
     .optional()
     .isIn(['pending', 'processing', 'completed', 'cancelled', 'refunded'])
-    .withMessage('Status must be one of: pending, processing, completed, cancelled, refunded')
+    .withMessage('Status must be one of: pending, processing, completed, cancelled, refunded'),
+  query('pickup_tracking_status')
+    .optional()
+    .isIn([
+      'order_successful',
+      'shipped',
+      'out_for_delivery',
+      'arrived_at_clinic',
+      'order_delivered_success'
+    ])
+    .withMessage('Invalid pickup_tracking_status filter')
+];
+
+
+const nearestClinicsValidation = [
+  query('latitude')
+    .notEmpty()
+    .withMessage('latitude query param is required')
+    .isFloat({ min: -90, max: 90 })
+    .withMessage('latitude must be between -90 and 90'),
+  query('longitude')
+    .notEmpty()
+    .withMessage('longitude query param is required')
+    .isFloat({ min: -180, max: 180 })
+    .withMessage('longitude must be between -180 and 180'),
+  query('limit')
+    .optional()
+    .isInt({ min: 1, max: 20 })
+    .withMessage('limit must be an integer between 1 and 20')
+];
+
+const updatePurchasePickupStatusValidation = [
+  param('id').isInt().withMessage('Purchase ID must be an integer'),
+  body('pickup_tracking_status')
+    .notEmpty().withMessage('pickup_tracking_status is required')
+    .isIn([
+      'order_successful',
+      'shipped',
+      'out_for_delivery',
+      'arrived_at_clinic',
+      'order_delivered_success'
+    ])
+    .withMessage('Invalid pickup_tracking_status')
 ];
 
 const addBookValidation = [
@@ -232,6 +248,45 @@ const addBookValidation = [
 router.get('/book', bookPurchaseController.getBook);
 router.post('/book', addBookValidation, bookPurchaseController.addBook);
 
+const createPickupClinicValidation = [
+  body('name')
+    .trim()
+    .notEmpty().withMessage('Clinic name is required')
+    .isLength({ min: 2, max: 255 }).withMessage('Clinic name must be between 2 and 255 characters'),
+  body('address')
+    .trim()
+    .notEmpty().withMessage('Address is required')
+    .isLength({ min: 5, max: 500 }).withMessage('Address must be between 5 and 500 characters'),
+  body('phone')
+    .optional()
+    .trim()
+    .matches(/^[+]?[(]?[0-9]{1,4}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?[-\s.]?[0-9]{1,9}$/)
+    .withMessage('Please provide a valid phone number'),
+  body('email')
+    .optional()
+    .trim()
+    .isEmail().withMessage('Please provide a valid email address'),
+  body('opening_hours')
+    .optional()
+    .trim()
+    .isLength({ max: 255 }).withMessage('Opening hours must be less than 255 characters'),
+  body('latitude')
+    .optional()
+    .isFloat({ min: -90, max: 90 })
+    .withMessage('Latitude must be between -90 and 90'),
+  body('longitude')
+    .optional()
+    .isFloat({ min: -180, max: 180 })
+    .withMessage('Longitude must be between -180 and 180'),
+  body('is_active')
+    .optional()
+    .isBoolean().withMessage('is_active must be a boolean')
+];
+
+router.get('/clinics/nearest', nearestClinicsValidation, bookPurchaseController.listNearestPickupClinics);
+router.get('/clinics', bookPurchaseController.listPickupClinics);
+
+router.post('/clinics', createPickupClinicValidation, bookPurchaseController.createPickupClinic);
 
 router.get('/addresses', authenticateToken, bookPurchaseController.getAddresses);
 router.post('/addresses', authenticateToken, addAddressValidation, bookPurchaseController.addAddress);
@@ -240,8 +295,16 @@ router.delete('/addresses/:id', authenticateToken, [param('id').isInt().withMess
 
 
 router.post('/purchase', authenticateToken, purchaseBookValidation, bookPurchaseController.purchaseBook);
+router.get('/my-orders', authenticateToken, getPurchaseHistoryValidation, bookPurchaseController.getMyOrders);
 router.get('/purchases', authenticateToken, getPurchaseHistoryValidation, bookPurchaseController.getPurchaseHistory);
 router.get('/purchases/:id', authenticateToken, [param('id').isInt().withMessage('Purchase ID must be an integer')], bookPurchaseController.getPurchaseById);
+router.patch(
+  '/purchases/:id/pickup-status',
+  authenticateToken,
+  requireAdmin,
+  updatePurchasePickupStatusValidation,
+  bookPurchaseController.updatePurchasePickupStatus
+);
 
 // Payment routes
 router.post('/payment-callback', bookPurchaseController.paymentCallback); // No auth - called by payment gateway

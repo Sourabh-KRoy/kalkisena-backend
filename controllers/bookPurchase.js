@@ -1,4 +1,4 @@
-const { Book, PurchaseBook, UserAddress, User, Payment } = require('../models');
+const { Book, PurchaseBook, UserAddress, User, Payment, PickupClinic } = require('../models');
 const { validationResult } = require('express-validator');
 const { Op } = require('sequelize');
 const axios = require('axios');
@@ -10,6 +10,92 @@ const crypto = require('crypto');
  */
 const BOOK_CLINIC_PICKUP_ADDRESS_LINE =
   'Clinic pickup — Kalkiism Research and Training Center (Kuleshwor). Ready approximately 2 months after payment. No home delivery.';
+
+const PICKUP_TRACKING_STATUS_LABELS = {
+  order_successful: 'Order successful',
+  shipped: 'Shipped',
+  out_for_delivery: 'Out for delivery',
+  arrived_at_clinic: 'Arrived at clinic',
+  order_delivered_success: 'Order delivered successfully'
+};
+
+const CLINIC_CARD_ATTRIBUTES = [
+  'id',
+  'name',
+  'address',
+  'phone',
+  'email',
+  'opening_hours',
+  'latitude',
+  'longitude'
+];
+
+const distanceKm = (lat1, lon1, lat2, lon2) => {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+};
+
+const clinicToPublicDTO = (clinic) => {
+  const c = clinic.get ? clinic.get({ plain: true }) : { ...clinic };
+  return {
+    id: c.id,
+    name: c.name,
+    address: c.address,
+    phone: c.phone,
+    email: c.email,
+    opening_hours: c.opening_hours,
+    latitude: c.latitude != null && c.latitude !== '' ? Number(c.latitude) : null,
+    longitude: c.longitude != null && c.longitude !== '' ? Number(c.longitude) : null
+  };
+};
+
+const pickupTrackingStatusLabel = (status) =>
+  PICKUP_TRACKING_STATUS_LABELS[status] || status || '';
+
+const formatClinicPickupAddress = (clinic) => {
+  const ch = clinic.get ? clinic.get({ plain: true }) : clinic;
+  const lines = [`Clinic pickup: ${ch.name}`, ch.address];
+  if (ch.opening_hours) lines.push(`Clinic hours: ${ch.opening_hours}`);
+  if (ch.phone) lines.push(`Clinic phone: ${ch.phone}`);
+  if (ch.email) lines.push(`Clinic email: ${ch.email}`);
+  lines.push('Ready approximately 2 months after payment. No home delivery.');
+  return lines.join('\n');
+};
+
+const withPickupLabels = (instance) => {
+  if (!instance) return null;
+  const plain = instance.get ? instance.get({ plain: true }) : instance;
+  return {
+    ...plain,
+    pickup_tracking_status_label: pickupTrackingStatusLabel(plain.pickup_tracking_status)
+  };
+};
+
+const formatMyOrderDTO = (purchase) => {
+  const plain = purchase.get ? purchase.get({ plain: true }) : { ...purchase };
+  const payment = plain.payment || null;
+  return {
+    id: plain.id,
+    order_id: plain.tracking_number,
+    quantity: plain.quantity,
+    unit_price: plain.unit_price,
+    total_price: plain.total_price,
+    purchase_date: plain.purchase_date,
+    status: plain.status,
+    pickup_tracking_status: plain.pickup_tracking_status,
+    pickup_tracking_status_label: pickupTrackingStatusLabel(plain.pickup_tracking_status),
+    payment_status: payment ? payment.status : null,
+    payment_order_id: payment ? payment.order_id : plain.tracking_number,
+    book: plain.book || null,
+    pickup_clinic: plain.pickup_clinic ? clinicToPublicDTO(plain.pickup_clinic) : null
+  };
+};
 
 /**
  * Payment Gateway Helper Class
@@ -558,8 +644,8 @@ const deleteAddress = async (req, res) => {
  * Purchase book with payment gateway integration
  * Fixed price: 1000 rupees
  *
- * Delivery is not used: books are picked up from the clinic after ~2 months.
- * `address_id` / address fields are optional; when omitted, a standard clinic-pickup line is stored.
+ * Customer must choose an active pickup clinic before payment. Books are collected
+ * from that clinic after ~2 months (no home delivery).
  */
 const purchaseBook = async (req, res) => {
   try {
@@ -575,13 +661,8 @@ const purchaseBook = async (req, res) => {
     const userId = req.user.id;
     const {
       book_id,
+      clinic_id,
       quantity = 1,
-      address_id,
-      address,
-      city,
-      state,
-      postal_code,
-      country,
       phone_number,
       notes
     } = req.body;
@@ -590,6 +671,7 @@ const purchaseBook = async (req, res) => {
     console.log('[BOOK_PURCHASE] Incoming purchase request:', {
       user_id: userId,
       book_id,
+      clinic_id,
       quantity,
       payment_inputs: paymentMethodDebug.candidates,
       selected_raw: paymentMethodDebug.selectedRaw,
@@ -621,60 +703,32 @@ const purchaseBook = async (req, res) => {
       });
     }
 
-    // Optional shipping-style fields (legacy / optional). Default: clinic pickup only.
-    let deliveryAddress = {
-      address: BOOK_CLINIC_PICKUP_ADDRESS_LINE,
+    const clinic = await PickupClinic.findOne({
+      where: { id: clinic_id, is_active: true }
+    });
+    if (!clinic) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pickup clinic not found or inactive'
+      });
+    }
+
+    logBookPurchaseEvent('CLINIC_SELECTED_FOR_PURCHASE', {
+      user_id: userId,
+      clinic_id: clinic.id,
+      clinic_name: clinic.name
+    });
+
+    const pickupClinicPayload = clinicToPublicDTO(clinic);
+
+    const deliveryAddress = {
+      address: formatClinicPickupAddress(clinic),
       city: null,
       state: null,
       postal_code: null,
       country: 'Nepal',
       phone_number: req.user.phone || phone_number || null
     };
-
-    if (address_id) {
-      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
-        user_id: userId,
-        address_id: Number(address_id),
-        mode: 'saved_address'
-      });
-      const savedAddress = await UserAddress.findOne({
-        where: { id: address_id, user_id: userId }
-      });
-
-      if (!savedAddress) {
-        return res.status(404).json({
-          success: false,
-          message: 'Address not found'
-        });
-      }
-
-      deliveryAddress = {
-        address: savedAddress.address,
-        city: savedAddress.city,
-        state: savedAddress.state,
-        postal_code: savedAddress.postal_code,
-        country: savedAddress.country,
-        phone_number: savedAddress.phone_number || req.user.phone || phone_number || null
-      };
-    } else if (address && String(address).trim()) {
-      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
-        user_id: userId,
-        mode: 'manual_address'
-      });
-      deliveryAddress = {
-        address: String(address).trim(),
-        city: city || null,
-        state: state || null,
-        postal_code: postal_code || null,
-        country: country || 'Nepal',
-        phone_number: phone_number || req.user.phone || null
-      };
-    } else {
-      logBookPurchaseEvent('ADDRESS_SELECTED_FOR_PURCHASE', {
-        user_id: userId,
-        mode: 'clinic_pickup_default'
-      });
-    }
 
     // Fixed price: 1000 rupees
     const FIXED_PRICE = 1000;
@@ -701,7 +755,8 @@ const purchaseBook = async (req, res) => {
       postal_code: deliveryAddress.postal_code,
       country: deliveryAddress.country,
       phone_number: deliveryAddress.phone_number,
-      notes: notes || null
+      notes: notes || null,
+      pickup_clinic_id: clinic.id
     };
 
     if (payment_method === 'esewa') {
@@ -760,6 +815,7 @@ const purchaseBook = async (req, res) => {
             author: book.author,
             image_url: book.image_url
           },
+          pickup_clinic: pickupClinicPayload,
           debug: {
             resolved_gateway: payment_method,
             selected_input: paymentMethodDebug.selectedRaw,
@@ -830,6 +886,7 @@ const purchaseBook = async (req, res) => {
           author: book.author,
           image_url: book.image_url
         },
+        pickup_clinic: pickupClinicPayload,
         debug: {
           resolved_gateway: payment_method,
           selected_input: paymentMethodDebug.selectedRaw,
@@ -848,18 +905,86 @@ const purchaseBook = async (req, res) => {
 };
 
 /**
+ * Get logged-in user's book orders (My Orders screen)
+ */
+const getMyOrders = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { page = 1, limit = 10, status, pickup_tracking_status } = req.query;
+
+    const offset = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const whereClause = { user_id: userId };
+
+    if (status) {
+      whereClause.status = status;
+    }
+    if (pickup_tracking_status) {
+      whereClause.pickup_tracking_status = pickup_tracking_status;
+    }
+
+    const { count, rows: purchases } = await PurchaseBook.findAndCountAll({
+      where: whereClause,
+      include: [
+        {
+          model: Book,
+          as: 'book',
+          attributes: ['id', 'title', 'author', 'price', 'image_url', 'currency']
+        },
+        {
+          model: PickupClinic,
+          as: 'pickup_clinic',
+          attributes: CLINIC_CARD_ATTRIBUTES
+        },
+        {
+          model: Payment,
+          as: 'payment',
+          attributes: ['id', 'order_id', 'status', 'amount']
+        }
+      ],
+      order: [['purchase_date', 'DESC']],
+      limit: parseInt(limit, 10),
+      offset
+    });
+
+    res.json({
+      success: true,
+      message: 'My orders retrieved successfully',
+      data: {
+        orders: purchases.map((p) => formatMyOrderDTO(p)),
+        pagination: {
+          total: count,
+          page: parseInt(page, 10),
+          limit: parseInt(limit, 10),
+          totalPages: Math.ceil(count / parseInt(limit, 10))
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get my orders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error retrieving my orders',
+      error: error.message
+    });
+  }
+};
+
+/**
  * Get purchase history for the authenticated user
  */
 const getPurchaseHistory = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { page = 1, limit = 10, status } = req.query;
+    const { page = 1, limit = 10, status, pickup_tracking_status } = req.query;
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const whereClause = { user_id: userId };
-    
+
     if (status) {
       whereClause.status = status;
+    }
+    if (pickup_tracking_status) {
+      whereClause.pickup_tracking_status = pickup_tracking_status;
     }
 
     const { count, rows: purchases } = await PurchaseBook.findAndCountAll({
@@ -869,6 +994,11 @@ const getPurchaseHistory = async (req, res) => {
           model: Book,
           as: 'book',
           attributes: ['id', 'title', 'author', 'price', 'image_url']
+        },
+        {
+          model: PickupClinic,
+          as: 'pickup_clinic',
+          attributes: CLINIC_CARD_ATTRIBUTES
         }
       ],
       order: [['purchase_date', 'DESC']],
@@ -880,7 +1010,7 @@ const getPurchaseHistory = async (req, res) => {
       success: true,
       message: 'Purchase history retrieved successfully',
       data: {
-        purchases,
+        purchases: purchases.map((p) => withPickupLabels(p)),
         pagination: {
           total: count,
           page: parseInt(page),
@@ -914,6 +1044,11 @@ const getPurchaseById = async (req, res) => {
           model: Book,
           as: 'book',
           attributes: ['id', 'title', 'author', 'price', 'image_url', 'description']
+        },
+        {
+          model: PickupClinic,
+          as: 'pickup_clinic',
+          attributes: CLINIC_CARD_ATTRIBUTES
         }
       ]
     });
@@ -928,7 +1063,7 @@ const getPurchaseById = async (req, res) => {
     res.json({
       success: true,
       message: 'Purchase retrieved successfully',
-      data: purchase
+      data: withPickupLabels(purchase)
     });
   } catch (error) {
     console.error('Get purchase by ID error:', error);
@@ -1056,6 +1191,8 @@ const paymentCallback = async (req, res) => {
           country: purchaseData.country,
           phone_number: purchaseData.phone_number,
           notes: purchaseData.notes,
+          pickup_clinic_id: purchaseData.pickup_clinic_id || null,
+          pickup_tracking_status: 'order_successful',
           status: 'processing',
           tracking_number: MerchantTxnId
         });
@@ -1199,6 +1336,8 @@ const esewaSuccessCallback = async (req, res) => {
         country: purchaseData.country,
         phone_number: purchaseData.phone_number,
         notes: purchaseData.notes,
+        pickup_clinic_id: purchaseData.pickup_clinic_id || null,
+        pickup_tracking_status: 'order_successful',
         status: 'processing',
         tracking_number: transaction_uuid
       });
@@ -1209,7 +1348,25 @@ const esewaSuccessCallback = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: 'eSewa payment complete. Purchase created/confirmed.',
-      data: { order_id: transaction_uuid, purchase_id: purchase.id }
+      data: {
+        order_id: transaction_uuid,
+        purchase: withPickupLabels(
+          await PurchaseBook.findByPk(purchase.id, {
+            include: [
+              {
+                model: Book,
+                as: 'book',
+                attributes: ['id', 'title', 'author', 'price', 'image_url']
+              },
+              {
+                model: PickupClinic,
+                as: 'pickup_clinic',
+                attributes: CLINIC_CARD_ATTRIBUTES
+              }
+            ]
+          })
+        )
+      }
     });
   } catch (error) {
     console.error('eSewa success callback error:', error);
@@ -1362,6 +1519,8 @@ const checkPaymentStatus = async (req, res) => {
             country: purchaseData.country,
             phone_number: purchaseData.phone_number,
             notes: purchaseData.notes,
+            pickup_clinic_id: purchaseData.pickup_clinic_id || null,
+            pickup_tracking_status: 'order_successful',
             status: 'processing',
             tracking_number: orderId
           });
@@ -1385,19 +1544,30 @@ const checkPaymentStatus = async (req, res) => {
             model: Book,
             as: 'book',
             attributes: ['id', 'title', 'author', 'price', 'image_url']
+          },
+          {
+            model: PickupClinic,
+            as: 'pickup_clinic',
+            attributes: CLINIC_CARD_ATTRIBUTES
           }
         ]
       });
     }
 
+    const purchasePlain = purchaseWithDetails ? purchaseWithDetails.get({ plain: true }) : null;
+
     res.json({
       success: true,
       message: 'Payment status retrieved successfully',
       data: {
-        purchase: purchaseWithDetails,
+        purchase: purchaseWithDetails ? withPickupLabels(purchaseWithDetails) : null,
         payment_status: paymentStatus,
         payment_details: status,
-        order_id: orderId
+        order_id: orderId,
+        pickup_tracking_status: purchasePlain?.pickup_tracking_status ?? null,
+        pickup_tracking_status_label: purchasePlain
+          ? pickupTrackingStatusLabel(purchasePlain.pickup_tracking_status)
+          : null
       }
     });
   } catch (error) {
@@ -1405,6 +1575,207 @@ const checkPaymentStatus = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error checking payment status',
+      error: error.message
+    });
+  }
+};
+
+const listNearestPickupClinics = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const lat = parseFloat(String(req.query.latitude));
+    const lng = parseFloat(String(req.query.longitude));
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '5'), 10) || 5, 1), 20);
+
+    const clinics = await PickupClinic.findAll({
+      where: {
+        is_active: true,
+        latitude: { [Op.ne]: null },
+        longitude: { [Op.ne]: null }
+      },
+      attributes: CLINIC_CARD_ATTRIBUTES
+    });
+
+    if (!clinics.length) {
+      return res.json({
+        success: true,
+        message:
+          'No clinics with coordinates on file; add latitude and longitude when creating clinics',
+        data: {
+          user_location: { latitude: lat, longitude: lng },
+          clinics: []
+        }
+      });
+    }
+
+    const ranked = clinics
+      .map((c) => {
+        const plain = c.get({ plain: true });
+        const cLat = Number(plain.latitude);
+        const cLng = Number(plain.longitude);
+        return {
+          ...clinicToPublicDTO(c),
+          distance_km: Math.round(distanceKm(lat, lng, cLat, cLng) * 100) / 100
+        };
+      })
+      .sort((a, b) => a.distance_km - b.distance_km)
+      .slice(0, limit);
+
+    res.json({
+      success: true,
+      message: 'Nearest pickup clinics',
+      data: {
+        user_location: { latitude: lat, longitude: lng },
+        clinics: ranked
+      }
+    });
+  } catch (error) {
+    console.error('List nearest pickup clinics error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error finding nearest clinics',
+      error: error.message
+    });
+  }
+};
+
+const listPickupClinics = async (req, res) => {
+  try {
+    const clinics = await PickupClinic.findAll({
+      where: { is_active: true },
+      order: [['name', 'ASC']],
+      attributes: CLINIC_CARD_ATTRIBUTES
+    });
+    res.json({
+      success: true,
+      message: 'Pickup clinics retrieved successfully',
+      data: clinics.map((c) => clinicToPublicDTO(c))
+    });
+  } catch (error) {
+    console.error('List pickup clinics error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error retrieving pickup clinics',
+      error: error.message
+    });
+  }
+};
+
+const createPickupClinic = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const {
+      name,
+      address,
+      phone,
+      email,
+      opening_hours,
+      latitude,
+      longitude,
+      is_active = true
+    } = req.body;
+
+    const hasLat =
+      latitude !== undefined && latitude !== null && String(latitude).trim() !== '';
+    const hasLng =
+      longitude !== undefined && longitude !== null && String(longitude).trim() !== '';
+    const latVal = hasLat ? parseFloat(String(latitude)) : null;
+    const lngVal = hasLng ? parseFloat(String(longitude)) : null;
+
+    const clinic = await PickupClinic.create({
+      name: String(name).trim(),
+      address: String(address).trim(),
+      phone: phone != null && String(phone).trim() !== '' ? String(phone).trim() : null,
+      email: email != null && String(email).trim() !== '' ? String(email).trim() : null,
+      opening_hours:
+        opening_hours != null && String(opening_hours).trim() !== ''
+          ? String(opening_hours).trim()
+          : null,
+      latitude: hasLat && hasLng ? latVal : null,
+      longitude: hasLat && hasLng ? lngVal : null,
+      is_active: Boolean(is_active)
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Pickup clinic created successfully',
+      data: clinicToPublicDTO(clinic)
+    });
+  } catch (error) {
+    console.error('Create pickup clinic error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating pickup clinic',
+      error: error.message
+    });
+  }
+};
+
+const updatePurchasePickupStatus = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const purchaseId = req.params.id;
+    const { pickup_tracking_status } = req.body;
+
+    const purchase = await PurchaseBook.findByPk(purchaseId);
+    if (!purchase) {
+      return res.status(404).json({
+        success: false,
+        message: 'Purchase not found'
+      });
+    }
+
+    await purchase.update({ pickup_tracking_status });
+
+    const updated = await PurchaseBook.findByPk(purchaseId, {
+      include: [
+        {
+          model: PickupClinic,
+          as: 'pickup_clinic',
+          attributes: CLINIC_CARD_ATTRIBUTES
+        },
+        {
+          model: Book,
+          as: 'book',
+          attributes: ['id', 'title', 'author', 'price', 'image_url']
+        }
+      ]
+    });
+
+    res.json({
+      success: true,
+      message: 'Pickup tracking status updated',
+      data: withPickupLabels(updated)
+    });
+  } catch (error) {
+    console.error('Update purchase pickup status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating pickup status',
       error: error.message
     });
   }
@@ -1418,10 +1789,15 @@ module.exports = {
   updateAddress,
   deleteAddress,
   purchaseBook,
+  getMyOrders,
   getPurchaseHistory,
   getPurchaseById,
   paymentCallback,
   esewaSuccessCallback,
   esewaFailureCallback,
-  checkPaymentStatus
+  checkPaymentStatus,
+  listPickupClinics,
+  listNearestPickupClinics,
+  createPickupClinic,
+  updatePurchasePickupStatus
 };

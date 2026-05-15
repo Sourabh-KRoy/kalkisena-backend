@@ -110,6 +110,27 @@ module.exports = (sequelize) => {
       allowNull: true,
       comment: 'Additional notes or special instructions'
     },
+    pickup_clinic_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'pickup_clinics',
+        key: 'id'
+      },
+      comment: 'Selected pickup clinic (required for new purchases)'
+    },
+    pickup_tracking_status: {
+      type: DataTypes.ENUM(
+        'order_successful',
+        'shipped',
+        'out_for_delivery',
+        'arrived_at_clinic',
+        'order_delivered_success'
+      ),
+      allowNull: false,
+      defaultValue: 'order_successful',
+      comment: 'Pickup / delivery progress for the customer'
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: false,
@@ -158,6 +179,10 @@ module.exports = (sequelize) => {
     PurchaseBook.belongsTo(models.Book, {
       foreignKey: 'book_id',
       as: 'book'
+    });
+    PurchaseBook.belongsTo(models.PickupClinic, {
+      foreignKey: 'pickup_clinic_id',
+      as: 'pickup_clinic'
     });
   };
 

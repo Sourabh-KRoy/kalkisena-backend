@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "migrate": "sequelize-cli db:migrate",
     "migrate:undo": "sequelize-cli db:migrate:undo",
-    "seed": "sequelize-cli db:seed:all"
+    "seed": "sequelize-cli db:seed:all",
+    "create-demo-order": "node scripts/create-demo-book-order.js"
   },
   "keywords": [
     "nodejs",
