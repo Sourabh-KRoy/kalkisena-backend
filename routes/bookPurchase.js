@@ -139,8 +139,16 @@ const getPurchaseHistoryValidation = [
     .isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
   query('status')
     .optional()
-    .isIn(['pending', 'processing', 'completed', 'cancelled', 'refunded'])
-    .withMessage('Status must be one of: pending, processing, completed, cancelled, refunded'),
+    .isIn([
+      'pending',
+      'pre_booked',
+      'awaiting_balance',
+      'processing',
+      'completed',
+      'cancelled',
+      'refunded'
+    ])
+    .withMessage('Invalid status filter'),
   query('pickup_tracking_status')
     .optional()
     .isIn([
@@ -295,6 +303,24 @@ router.delete('/addresses/:id', authenticateToken, [param('id').isInt().withMess
 
 
 router.post('/purchase', authenticateToken, purchaseBookValidation, bookPurchaseController.purchaseBook);
+router.post(
+  '/purchases/:id/pay-balance',
+  authenticateToken,
+  purchaseBookValidation,
+  bookPurchaseController.payBookBalance
+);
+router.patch(
+  '/book/:id/balance-payment',
+  authenticateToken,
+  requireAdmin,
+  [
+    body('balance_payment_enabled')
+      .optional()
+      .isBoolean()
+      .withMessage('balance_payment_enabled must be a boolean')
+  ],
+  bookPurchaseController.setBookBalancePaymentEnabled
+);
 router.get('/my-orders', authenticateToken, getPurchaseHistoryValidation, bookPurchaseController.getMyOrders);
 router.get('/purchases', authenticateToken, getPurchaseHistoryValidation, bookPurchaseController.getPurchaseHistory);
 router.get('/purchases/:id', authenticateToken, [param('id').isInt().withMessage('Purchase ID must be an integer')], bookPurchaseController.getPurchaseById);

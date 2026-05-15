@@ -80,6 +80,12 @@ module.exports = (sequelize) => {
       defaultValue: true,
       comment: 'Whether the book is available for purchase'
     },
+    balance_payment_enabled: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+      comment: 'When true, pre-booked users can pay the remaining balance for clinic pickup'
+    },
     created_at: {
       type: DataTypes.DATE,
       allowNull: false,

@@ -83,8 +83,37 @@ module.exports = (sequelize) => {
       allowNull: true,
       comment: 'Contact phone number for delivery'
     },
+    balance_payment_id: {
+      type: DataTypes.BIGINT.UNSIGNED,
+      allowNull: true,
+      references: {
+        model: 'payments',
+        key: 'id'
+      },
+      comment: 'Payment for remaining balance after pre-booking'
+    },
+    amount_paid: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false,
+      defaultValue: 0,
+      comment: 'Total paid so far (pre-booking + balance)'
+    },
+    balance_due: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false,
+      defaultValue: 0,
+      comment: 'Remaining balance before pickup'
+    },
     status: {
-      type: DataTypes.ENUM('pending', 'processing', 'completed', 'cancelled', 'refunded'),
+      type: DataTypes.ENUM(
+        'pending',
+        'pre_booked',
+        'awaiting_balance',
+        'processing',
+        'completed',
+        'cancelled',
+        'refunded'
+      ),
       allowNull: false,
       defaultValue: 'pending'
     },
@@ -171,6 +200,10 @@ module.exports = (sequelize) => {
     PurchaseBook.belongsTo(models.Payment, {
       foreignKey: 'payment_id',
       as: 'payment'
+    });
+    PurchaseBook.belongsTo(models.Payment, {
+      foreignKey: 'balance_payment_id',
+      as: 'balance_payment'
     });
     PurchaseBook.belongsTo(models.User, {
       foreignKey: 'user_id',

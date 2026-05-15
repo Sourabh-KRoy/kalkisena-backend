@@ -9,7 +9,22 @@ const crypto = require('crypto');
  * `purchase_book.address` when the client does not send shipping details.
  */
 const BOOK_CLINIC_PICKUP_ADDRESS_LINE =
-  'Clinic pickup — Kalkiism Research and Training Center (Kuleshwor). Ready approximately 2 months after payment. No home delivery.';
+  'Clinic pickup — Kalkiism Research and Training Center (Kuleshwor). Ready approximately 2 months after full payment. No home delivery.';
+
+const BOOK_FULL_PRICE = parseFloat(process.env.BOOK_FULL_PRICE || '1000');
+const BOOK_PRE_BOOKING_AMOUNT = parseFloat(process.env.BOOK_PRE_BOOKING_AMOUNT || '100');
+const BOOK_BALANCE_AMOUNT = parseFloat(
+  process.env.BOOK_BALANCE_AMOUNT || String(BOOK_FULL_PRICE - BOOK_PRE_BOOKING_AMOUNT)
+);
+
+const BOOK_PRICING_SUMMARY = {
+  full_price: BOOK_FULL_PRICE,
+  pre_booking_amount: BOOK_PRE_BOOKING_AMOUNT,
+  balance_amount: BOOK_BALANCE_AMOUNT,
+  currency: 'NPR',
+  note:
+    'Pay NPR 100 now to pre-book. When the book is available (typically in 2–3 months), pay the remaining NPR 900 and collect from your selected clinic.'
+};
 
 const PICKUP_TRACKING_STATUS_LABELS = {
   order_successful: 'Order successful',
@@ -64,7 +79,7 @@ const formatClinicPickupAddress = (clinic) => {
   if (ch.opening_hours) lines.push(`Clinic hours: ${ch.opening_hours}`);
   if (ch.phone) lines.push(`Clinic phone: ${ch.phone}`);
   if (ch.email) lines.push(`Clinic email: ${ch.email}`);
-  lines.push('Ready approximately 2 months after payment. No home delivery.');
+  lines.push('Pre-book with NPR 100; pay remaining NPR 900 when available (~2–3 months), then collect from clinic.');
   return lines.join('\n');
 };
 
@@ -77,23 +92,53 @@ const withPickupLabels = (instance) => {
   };
 };
 
+const parsePaymentGatewayResponse = (payment) => {
+  try {
+    if (payment?.gateway_response) return JSON.parse(payment.gateway_response);
+  } catch (e) {
+    // ignore
+  }
+  return {};
+};
+
+const canPayBalanceForPurchase = (purchase, book) => {
+  const plain = purchase.get ? purchase.get({ plain: true }) : purchase;
+  const bookPlain = book?.get ? book.get({ plain: true }) : book;
+  const balanceDue = Number(plain.balance_due || 0);
+  return (
+    (plain.status === 'pre_booked' || plain.status === 'awaiting_balance') &&
+    balanceDue > 0 &&
+    Boolean(bookPlain?.balance_payment_enabled)
+  );
+};
+
 const formatMyOrderDTO = (purchase) => {
   const plain = purchase.get ? purchase.get({ plain: true }) : { ...purchase };
   const payment = plain.payment || null;
+  const balancePayment = plain.balance_payment || null;
+  const book = plain.book || null;
   return {
     id: plain.id,
     order_id: plain.tracking_number,
     quantity: plain.quantity,
     unit_price: plain.unit_price,
     total_price: plain.total_price,
+    amount_paid: plain.amount_paid != null ? Number(plain.amount_paid) : null,
+    balance_due: plain.balance_due != null ? Number(plain.balance_due) : null,
     purchase_date: plain.purchase_date,
     status: plain.status,
+    is_pre_booking: plain.status === 'pre_booked' || plain.status === 'awaiting_balance',
+    can_pay_balance: canPayBalanceForPurchase(plain, book),
+    balance_payment_available: Boolean(book?.balance_payment_enabled),
     pickup_tracking_status: plain.pickup_tracking_status,
     pickup_tracking_status_label: pickupTrackingStatusLabel(plain.pickup_tracking_status),
     payment_status: payment ? payment.status : null,
     payment_order_id: payment ? payment.order_id : plain.tracking_number,
-    book: plain.book || null,
-    pickup_clinic: plain.pickup_clinic ? clinicToPublicDTO(plain.pickup_clinic) : null
+    balance_payment_status: balancePayment ? balancePayment.status : null,
+    balance_payment_order_id: balancePayment ? balancePayment.order_id : null,
+    book: book || null,
+    pickup_clinic: plain.pickup_clinic ? clinicToPublicDTO(plain.pickup_clinic) : null,
+    pricing: BOOK_PRICING_SUMMARY
   };
 };
 
@@ -306,6 +351,219 @@ const normalizePaymentMethod = (reqBody = {}) => {
   return 'nepalpayment';
 };
 
+/**
+ * Generate order ID for balance payment.
+ * Format: BB-{YYYYMMDD}-{SEQUENCE}-{RANDOM}
+ */
+const generateBalanceOrderId = async () => {
+  const datePrefix = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const randomSuffix = crypto.randomBytes(2).toString('hex').toUpperCase().slice(0, 4);
+
+  const lastOrder = await Payment.findOne({
+    where: { order_id: { [Op.like]: `BB-${datePrefix}-%` } },
+    order: [['id', 'DESC']]
+  });
+
+  let sequence = '0001';
+  if (lastOrder?.order_id) {
+    const match = lastOrder.order_id.match(/BB-\d+-(\d+)-/);
+    if (match) sequence = String(parseInt(match[1], 10) + 1).padStart(4, '0');
+  }
+
+  let orderId = `BB-${datePrefix}-${sequence}-${randomSuffix}`;
+  const exists = await Payment.findOne({ where: { order_id: orderId } });
+  if (exists) {
+    const newRandomSuffix = crypto.randomBytes(2).toString('hex').toUpperCase().slice(0, 4);
+    orderId = `BB-${datePrefix}-${sequence}-${newRandomSuffix}`;
+  }
+  return orderId;
+};
+
+const createPreBookingPurchase = async (payment, purchaseData, trackingNumber) => {
+  const existing = await PurchaseBook.findOne({
+    where: { tracking_number: trackingNumber }
+  });
+  if (existing) return existing;
+
+  const book = await Book.findByPk(purchaseData.book_id);
+  if (!book) throw new Error('Book not found');
+  if (!book.is_active) throw new Error('Book is not available for pre-booking');
+
+  const quantity = purchaseData.quantity || 1;
+  const totalPrice = BOOK_FULL_PRICE * quantity;
+  const prePaid = BOOK_PRE_BOOKING_AMOUNT * quantity;
+  const balanceDue = BOOK_BALANCE_AMOUNT * quantity;
+
+  return PurchaseBook.create({
+    payment_id: payment.id,
+    user_id: purchaseData.user_id,
+    book_id: purchaseData.book_id,
+    quantity,
+    unit_price: BOOK_FULL_PRICE,
+    total_price: totalPrice,
+    amount_paid: prePaid,
+    balance_due: balanceDue,
+    address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
+    city: purchaseData.city,
+    state: purchaseData.state,
+    postal_code: purchaseData.postal_code,
+    country: purchaseData.country,
+    phone_number: purchaseData.phone_number,
+    notes: purchaseData.notes,
+    pickup_clinic_id: purchaseData.pickup_clinic_id || null,
+    pickup_tracking_status: 'order_successful',
+    status: 'pre_booked',
+    tracking_number: trackingNumber
+  });
+};
+
+const applyBalancePaymentSuccess = async (payment, purchaseData) => {
+  const purchase = await PurchaseBook.findOne({
+    where: { id: purchaseData.purchase_id, user_id: purchaseData.user_id }
+  });
+  if (!purchase) throw new Error('Pre-booking order not found');
+
+  if (purchase.status === 'processing' || purchase.status === 'completed') {
+    return purchase;
+  }
+
+  if (purchase.status !== 'pre_booked' && purchase.status !== 'awaiting_balance') {
+    throw new Error('Order is not eligible for balance payment');
+  }
+
+  const book = await Book.findByPk(purchase.book_id);
+  if (!book) throw new Error('Book not found');
+  if (!book.balance_payment_enabled) {
+    throw new Error('Balance payment is not open yet. The book is not available for pickup payment.');
+  }
+  if (book.stock < purchase.quantity) {
+    throw new Error(`Insufficient stock. Only ${book.stock} available.`);
+  }
+
+  const paidNow = Number(payment.amount);
+  const newAmountPaid = Number(purchase.amount_paid) + paidNow;
+  const newBalanceDue = Math.max(0, Number(purchase.total_price) - newAmountPaid);
+
+  await purchase.update({
+    balance_payment_id: payment.id,
+    amount_paid: newAmountPaid,
+    balance_due: newBalanceDue,
+    status: 'processing',
+    pickup_tracking_status: 'order_successful'
+  });
+
+  await book.update({ stock: book.stock - purchase.quantity });
+  return purchase;
+};
+
+const fulfillBookPayment = async (payment, options = {}) => {
+  const gatewayResponseData = parsePaymentGatewayResponse(payment);
+  const purchaseData = gatewayResponseData.purchase_data;
+  if (!purchaseData) {
+    throw new Error('Purchase data not found in payment record');
+  }
+
+  const phase = purchaseData.payment_phase || 'pre_booking';
+  const trackingNumber = options.trackingNumber || payment.order_id;
+
+  if (phase === 'balance') {
+    return applyBalancePaymentSuccess(payment, purchaseData);
+  }
+
+  return createPreBookingPurchase(payment, purchaseData, trackingNumber);
+};
+
+const buildPaymentInitResponse = ({
+  res,
+  paymentMethod,
+  paymentMethodDebug,
+  orderId,
+  amount,
+  payment,
+  processId,
+  esewaPayload,
+  book,
+  pickupClinicPayload,
+  message,
+  payment_phase
+}) => {
+  const appUrl = process.env.APP_URL || 'http://localhost:3000';
+
+  if (paymentMethod === 'esewa') {
+    return res.status(200).json({
+      success: true,
+      message,
+      data: {
+        gateway: 'ESEWA',
+        payment_method: 'esewa',
+        paymentMethod: 'esewa',
+        payment_phase,
+        order_id: orderId,
+        amount,
+        currency: 'NPR',
+        payment_url: esewaGateway.formUrl,
+        form_data: esewaPayload,
+        pricing: BOOK_PRICING_SUMMARY,
+        book: {
+          id: book.id,
+          title: book.title,
+          author: book.author,
+          image_url: book.image_url
+        },
+        pickup_clinic: pickupClinicPayload,
+        debug: {
+          resolved_gateway: paymentMethod,
+          selected_input: paymentMethodDebug.selectedRaw,
+          normalized_input: paymentMethodDebug.normalized
+        }
+      }
+    });
+  }
+
+  const paymentUrl =
+    process.env.NEPAL_PAYMENT_GATEWAY_URL ||
+    'https://gatewaysandbox.nepalpayment.com/Payment/Index';
+  const responseUrl =
+    process.env.NEPAL_PAYMENT_RESPONSE_URL ||
+    `${appUrl}/api/book-purchase/payment-callback`;
+
+  return res.status(200).json({
+    success: true,
+    message,
+    data: {
+      gateway: 'NEPALPAYMENT',
+      payment_method: 'nepalpayment',
+      paymentMethod: 'nepalpayment',
+      payment_phase,
+      order_id: orderId,
+      amount,
+      currency: 'NPR',
+      payment_url: paymentUrl,
+      form_data: {
+        MerchantId: paymentGateway.merchantId,
+        MerchantName: paymentGateway.merchantName,
+        Amount: amount,
+        MerchantTxnId: orderId,
+        ProcessId: processId,
+        ResponseUrl: responseUrl
+      },
+      pricing: BOOK_PRICING_SUMMARY,
+      book: {
+        id: book.id,
+        title: book.title,
+        author: book.author,
+        image_url: book.image_url
+      },
+      pickup_clinic: pickupClinicPayload,
+      debug: {
+        resolved_gateway: paymentMethod,
+        selected_input: paymentMethodDebug.selectedRaw,
+        normalized_input: paymentMethodDebug.normalized
+      }
+    }
+  });
+};
+
 const resolvePaymentMethodDebug = (reqBody = {}) => {
   const candidates = {
     payment_method: reqBody.payment_method,
@@ -430,7 +688,11 @@ const getBook = async (req, res) => {
     res.json({
       success: true,
       message: 'Book retrieved successfully',
-      data: book
+      data: {
+        ...book.toJSON(),
+        pricing: BOOK_PRICING_SUMMARY,
+        balance_payment_enabled: Boolean(book.balance_payment_enabled)
+      }
     });
   } catch (error) {
     console.error('Get book error:', error);
@@ -641,11 +903,8 @@ const deleteAddress = async (req, res) => {
 };
 
 /**
- * Purchase book with payment gateway integration
- * Fixed price: 1000 rupees
- *
- * Customer must choose an active pickup clinic before payment. Books are collected
- * from that clinic after ~2 months (no home delivery).
+ * Pre-book a book: pay NPR 100 now. When the book is available (~2–3 months),
+ * pay the remaining NPR 900 and pick up from the selected clinic.
  */
 const purchaseBook = async (req, res) => {
   try {
@@ -696,13 +955,6 @@ const purchaseBook = async (req, res) => {
       });
     }
 
-    if (book.stock < quantity) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient stock. Only ${book.stock} available.`
-      });
-    }
-
     const clinic = await PickupClinic.findOne({
       where: { id: clinic_id, is_active: true }
     });
@@ -730,25 +982,18 @@ const purchaseBook = async (req, res) => {
       phone_number: req.user.phone || phone_number || null
     };
 
-    // Fixed price: 1000 rupees
-    const FIXED_PRICE = 1000;
-    const unitPrice = FIXED_PRICE;
-    const totalPrice = FIXED_PRICE * quantity;
-
-    // Generate order ID
+    const chargeAmount = BOOK_PRE_BOOKING_AMOUNT * quantity;
     const orderId = await paymentGateway.generateOrderId();
 
-    // Create payment record first
-    let payment;
-    let processId = null;
-    
-    // Prepare purchase data to store in payment record (will be used to create purchase after payment success)
     const purchaseData = {
+      payment_phase: 'pre_booking',
       user_id: userId,
       book_id: book.id,
       quantity,
-      unit_price: unitPrice,
-      total_price: totalPrice,
+      unit_price: BOOK_FULL_PRICE,
+      total_price: BOOK_FULL_PRICE * quantity,
+      pre_booking_amount: chargeAmount,
+      balance_amount: BOOK_BALANCE_AMOUNT * quantity,
       address: deliveryAddress.address,
       city: deliveryAddress.city,
       state: deliveryAddress.state,
@@ -759,19 +1004,20 @@ const purchaseBook = async (req, res) => {
       pickup_clinic_id: clinic.id
     };
 
+    const initMessage =
+      'Pre-booking payment initialized (NPR 100). Complete payment to reserve your book. Pay the remaining NPR 900 when the book is available for clinic pickup.';
+
     if (payment_method === 'esewa') {
       const appUrl = process.env.APP_URL || 'http://localhost:3000';
       const successUrl = process.env.ESEWA_SUCCESS_URL || `${appUrl}/api/book-purchase/esewa/success`;
       const failureUrl = process.env.ESEWA_FAILURE_URL || `${appUrl}/api/book-purchase/esewa/failure`;
-
-      // eSewa requires transaction_uuid to be alphanumeric and hyphen(-) only.
       const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
       const signedFieldNames = 'total_amount,transaction_uuid,product_code';
 
       const esewaPayload = {
-        amount: String(totalPrice),
+        amount: String(chargeAmount),
         tax_amount: '0',
-        total_amount: String(totalPrice),
+        total_amount: String(chargeAmount),
         transaction_uuid: transactionUuid,
         product_code: esewaGateway.productCode,
         product_service_charge: '0',
@@ -784,10 +1030,9 @@ const purchaseBook = async (req, res) => {
       const { signature, message } = esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
       esewaPayload.signature = signature;
 
-      // Save payment record with purchase data in gateway_response
-      payment = await Payment.create({
+      await Payment.create({
         order_id: transactionUuid,
-        amount: totalPrice,
+        amount: chargeAmount,
         process_id: null,
         status: 'INITIATED',
         gateway_response: JSON.stringify({
@@ -798,37 +1043,22 @@ const purchaseBook = async (req, res) => {
         })
       });
 
-      return res.status(200).json({
-        success: true,
-        message: 'eSewa payment initialized. Please complete the payment. Purchase will be created after successful payment.',
-        data: {
-          gateway: 'ESEWA',
-          payment_method: 'esewa',
-          paymentMethod: 'esewa',
-          order_id: transactionUuid,
-          amount: totalPrice,
-          payment_url: esewaGateway.formUrl,
-          form_data: esewaPayload,
-          book: {
-            id: book.id,
-            title: book.title,
-            author: book.author,
-            image_url: book.image_url
-          },
-          pickup_clinic: pickupClinicPayload,
-          debug: {
-            resolved_gateway: payment_method,
-            selected_input: paymentMethodDebug.selectedRaw,
-            normalized_input: paymentMethodDebug.normalized
-          }
-        }
+      return buildPaymentInitResponse({
+        res,
+        paymentMethod: payment_method,
+        paymentMethodDebug,
+        orderId: transactionUuid,
+        amount: chargeAmount,
+        esewaPayload,
+        book,
+        pickupClinicPayload,
+        message: initMessage,
+        payment_phase: 'pre_booking'
       });
     }
 
-    // Default: NepalPayment (keep apisandbox integration)
     try {
-      const paymentResponse = await paymentGateway.createPayment(totalPrice.toString(), orderId);
-
+      const paymentResponse = await paymentGateway.createPayment(String(chargeAmount), orderId);
       if (!paymentResponse.code || paymentResponse.code !== '0') {
         return res.status(400).json({
           success: false,
@@ -837,11 +1067,10 @@ const purchaseBook = async (req, res) => {
         });
       }
 
-      processId = paymentResponse.data?.ProcessId || null;
-
-      payment = await Payment.create({
+      const processId = paymentResponse.data?.ProcessId || null;
+      await Payment.create({
         order_id: orderId,
-        amount: totalPrice,
+        amount: chargeAmount,
         process_id: processId,
         status: 'INITIATED',
         gateway_response: JSON.stringify({
@@ -850,55 +1079,245 @@ const purchaseBook = async (req, res) => {
           purchase_data: purchaseData
         })
       });
+
+      return buildPaymentInitResponse({
+        res,
+        paymentMethod: payment_method,
+        paymentMethodDebug,
+        orderId,
+        amount: chargeAmount,
+        processId,
+        book,
+        pickupClinicPayload,
+        message: initMessage,
+        payment_phase: 'pre_booking'
+      });
     } catch (paymentError) {
       console.error('Payment creation error:', paymentError);
       return res.status(500).json({
         success: false,
-        message: 'Error initializing payment',
+        message: 'Error initializing pre-booking payment',
         error: paymentError.response?.data || paymentError.message
       });
     }
-
-    const paymentUrl = process.env.NEPAL_PAYMENT_GATEWAY_URL || 'https://gatewaysandbox.nepalpayment.com/Payment/Index';
-    const responseUrl = process.env.NEPAL_PAYMENT_RESPONSE_URL || `${process.env.APP_URL || 'http://localhost:3000'}/api/book-purchase/payment-callback`;
-
-    return res.status(200).json({
-      success: true,
-      message: 'Payment initialized. Please complete the payment. Purchase will be created after successful payment.',
-      data: {
-        gateway: 'NEPALPAYMENT',
-        payment_method: 'nepalpayment',
-        paymentMethod: 'nepalpayment',
-        order_id: orderId,
-        amount: totalPrice,
-        payment_url: paymentUrl,
-        form_data: {
-          MerchantId: paymentGateway.merchantId,
-          MerchantName: paymentGateway.merchantName,
-          Amount: totalPrice,
-          MerchantTxnId: orderId,
-          ProcessId: processId,
-          ResponseUrl: responseUrl
-        },
-        book: {
-          id: book.id,
-          title: book.title,
-          author: book.author,
-          image_url: book.image_url
-        },
-        pickup_clinic: pickupClinicPayload,
-        debug: {
-          resolved_gateway: payment_method,
-          selected_input: paymentMethodDebug.selectedRaw,
-          normalized_input: paymentMethodDebug.normalized
-        }
-      }
-    });
   } catch (error) {
     console.error('Purchase book error:', error);
     res.status(500).json({
       success: false,
       message: 'Error purchasing book',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Pay remaining balance (NPR 900) for a pre-booked order when the book is available.
+ */
+const payBookBalance = async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const userId = req.user.id;
+    const purchaseId = parseInt(req.params.id, 10);
+    const payment_method = normalizePaymentMethod(req.body);
+    const paymentMethodDebug = resolvePaymentMethodDebug(req.body);
+
+    const purchase = await PurchaseBook.findOne({
+      where: { id: purchaseId, user_id: userId },
+      include: [{ model: Book, as: 'book' }]
+    });
+
+    if (!purchase) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    if (!canPayBalanceForPurchase(purchase, purchase.book)) {
+      const bookReady = Boolean(purchase.book?.balance_payment_enabled);
+      return res.status(400).json({
+        success: false,
+        message: bookReady
+          ? 'This order is not eligible for balance payment.'
+          : 'Balance payment is not open yet. The book is not available for pickup payment (typically 2–3 months after pre-booking).',
+        data: {
+          order_id: purchase.tracking_number,
+          status: purchase.status,
+          balance_due: Number(purchase.balance_due),
+          balance_payment_available: bookReady
+        }
+      });
+    }
+
+    const quantity = purchase.quantity || 1;
+    const chargeAmount = Number(purchase.balance_due) || BOOK_BALANCE_AMOUNT * quantity;
+    const orderId = await generateBalanceOrderId();
+
+    const purchaseData = {
+      payment_phase: 'balance',
+      purchase_id: purchase.id,
+      user_id: userId,
+      book_id: purchase.book_id,
+      quantity,
+      balance_amount: chargeAmount
+    };
+
+    const initMessage =
+      'Balance payment initialized (NPR 900). Complete payment to confirm clinic pickup when your book is ready.';
+
+    if (payment_method === 'esewa') {
+      const appUrl = process.env.APP_URL || 'http://localhost:3000';
+      const successUrl = process.env.ESEWA_SUCCESS_URL || `${appUrl}/api/book-purchase/esewa/success`;
+      const failureUrl = process.env.ESEWA_FAILURE_URL || `${appUrl}/api/book-purchase/esewa/failure`;
+      const transactionUuid = String(orderId).replace(/[^a-zA-Z0-9-]/g, '-');
+      const signedFieldNames = 'total_amount,transaction_uuid,product_code';
+
+      const esewaPayload = {
+        amount: String(chargeAmount),
+        tax_amount: '0',
+        total_amount: String(chargeAmount),
+        transaction_uuid: transactionUuid,
+        product_code: esewaGateway.productCode,
+        product_service_charge: '0',
+        product_delivery_charge: '0',
+        success_url: successUrl,
+        failure_url: failureUrl,
+        signed_field_names: signedFieldNames
+      };
+
+      const { signature, message } = esewaGateway.signatureFromFields(esewaPayload, signedFieldNames);
+      esewaPayload.signature = signature;
+
+      await Payment.create({
+        order_id: transactionUuid,
+        amount: chargeAmount,
+        process_id: null,
+        status: 'INITIATED',
+        gateway_response: JSON.stringify({
+          gateway: 'ESEWA',
+          signature_message: message,
+          payment_request: esewaPayload,
+          purchase_data: purchaseData
+        })
+      });
+
+      return buildPaymentInitResponse({
+        res,
+        paymentMethod: payment_method,
+        paymentMethodDebug,
+        orderId: transactionUuid,
+        amount: chargeAmount,
+        esewaPayload,
+        book: purchase.book,
+        pickupClinicPayload: purchase.pickup_clinic_id
+          ? clinicToPublicDTO(
+              await PickupClinic.findByPk(purchase.pickup_clinic_id, {
+                attributes: CLINIC_CARD_ATTRIBUTES
+              })
+            )
+          : null,
+        message: initMessage,
+        payment_phase: 'balance'
+      });
+    }
+
+    const paymentResponse = await paymentGateway.createPayment(String(chargeAmount), orderId);
+    if (!paymentResponse.code || paymentResponse.code !== '0') {
+      return res.status(400).json({
+        success: false,
+        message: 'Balance payment initialization failed',
+        error: paymentResponse.message || 'Unable to initialize payment'
+      });
+    }
+
+    const processId = paymentResponse.data?.ProcessId || null;
+    await Payment.create({
+      order_id: orderId,
+      amount: chargeAmount,
+      process_id: processId,
+      status: 'INITIATED',
+      gateway_response: JSON.stringify({
+        gateway: 'NEPALPAYMENT',
+        payment_response: paymentResponse,
+        purchase_data: purchaseData
+      })
+    });
+
+    const clinic =
+      purchase.pickup_clinic_id &&
+      (await PickupClinic.findByPk(purchase.pickup_clinic_id, {
+        attributes: CLINIC_CARD_ATTRIBUTES
+      }));
+
+    return buildPaymentInitResponse({
+      res,
+      paymentMethod: payment_method,
+      paymentMethodDebug,
+      orderId,
+      amount: chargeAmount,
+      processId,
+      book: purchase.book,
+      pickupClinicPayload: clinic ? clinicToPublicDTO(clinic) : null,
+      message: initMessage,
+      payment_phase: 'balance'
+    });
+  } catch (error) {
+    console.error('Pay book balance error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error initializing balance payment',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Admin: enable balance payment on a book when stock is ready for pickup.
+ */
+const setBookBalancePaymentEnabled = async (req, res) => {
+  try {
+    const bookId = parseInt(req.params.id, 10);
+    const enabled =
+      req.body.balance_payment_enabled !== undefined
+        ? Boolean(req.body.balance_payment_enabled)
+        : true;
+
+    const book = await Book.findByPk(bookId);
+    if (!book) {
+      return res.status(404).json({ success: false, message: 'Book not found' });
+    }
+
+    await book.update({ balance_payment_enabled: enabled });
+
+    if (enabled) {
+      await PurchaseBook.update(
+        { status: 'awaiting_balance' },
+        { where: { book_id: book.id, status: 'pre_booked' } }
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: enabled
+        ? 'Balance payment enabled. Pre-booked customers can now pay NPR 900 and pick up from clinic.'
+        : 'Balance payment disabled for this book.',
+      data: {
+        id: book.id,
+        title: book.title,
+        balance_payment_enabled: book.balance_payment_enabled,
+        pricing: BOOK_PRICING_SUMMARY
+      }
+    });
+  } catch (error) {
+    console.error('Set book balance payment enabled error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error updating book balance payment setting',
       error: error.message
     });
   }
@@ -938,6 +1357,11 @@ const getMyOrders = async (req, res) => {
         {
           model: Payment,
           as: 'payment',
+          attributes: ['id', 'order_id', 'status', 'amount']
+        },
+        {
+          model: Payment,
+          as: 'balance_payment',
           attributes: ['id', 'order_id', 'status', 'amount']
         }
       ],
@@ -1043,13 +1467,23 @@ const getPurchaseById = async (req, res) => {
         {
           model: Book,
           as: 'book',
-          attributes: ['id', 'title', 'author', 'price', 'image_url', 'description']
+          attributes: [
+            'id',
+            'title',
+            'author',
+            'price',
+            'image_url',
+            'description',
+            'balance_payment_enabled'
+          ]
         },
         {
           model: PickupClinic,
           as: 'pickup_clinic',
           attributes: CLINIC_CARD_ATTRIBUTES
-        }
+        },
+        { model: Payment, as: 'payment', attributes: ['id', 'order_id', 'status', 'amount'] },
+        { model: Payment, as: 'balance_payment', attributes: ['id', 'order_id', 'status', 'amount'] }
       ]
     });
 
@@ -1063,7 +1497,7 @@ const getPurchaseById = async (req, res) => {
     res.json({
       success: true,
       message: 'Purchase retrieved successfully',
-      data: withPickupLabels(purchase)
+      data: formatMyOrderDTO(purchase)
     });
   } catch (error) {
     console.error('Get purchase by ID error:', error);
@@ -1121,93 +1555,25 @@ const paymentCallback = async (req, res) => {
       console.error('Error parsing gateway_response:', e);
     }
 
-    // Update payment record with new status and preserve purchase_data
     await payment.update({
       status: paymentStatus,
       gateway_response: JSON.stringify({
+        gateway: gatewayResponseData.gateway || 'NEPALPAYMENT',
         payment_response: status,
         purchase_data: gatewayResponseData.purchase_data || null
       }),
       updated_at: new Date()
     });
 
-    // Only create purchase record if payment is successful
     if (paymentStatus === 'SUCCESS') {
-      // Check if purchase already exists (in case callback is called multiple times)
-      let purchase = await PurchaseBook.findOne({
-        where: { tracking_number: MerchantTxnId }
-      });
-
-      if (!purchase) {
-        // Extract purchase data from payment record
-        const purchaseData = gatewayResponseData.purchase_data;
-        
-        if (!purchaseData) {
-          console.error('Purchase data not found in payment record for order:', MerchantTxnId);
-          return res.status(400).json({
-            success: false,
-            message: 'Purchase data not found in payment record'
-          });
-        }
-
-        // Verify book still exists and is available
-        const book = await Book.findByPk(purchaseData.book_id);
-        if (!book) {
-          console.error('Book not found for purchase:', purchaseData.book_id);
-          return res.status(404).json({
-            success: false,
-            message: 'Book not found'
-          });
-        }
-
-        if (!book.is_active) {
-          console.error('Book is not active:', purchaseData.book_id);
-          return res.status(400).json({
-            success: false,
-            message: 'Book is not available for purchase'
-          });
-        }
-
-        if (book.stock < purchaseData.quantity) {
-          console.error('Insufficient stock for book:', purchaseData.book_id);
-          return res.status(400).json({
-            success: false,
-            message: `Insufficient stock. Only ${book.stock} available.`
-          });
-        }
-
-        // Create purchase record with processing status and link to payment
-        purchase = await PurchaseBook.create({
-          payment_id: payment.id,
-          user_id: purchaseData.user_id,
-          book_id: purchaseData.book_id,
-          quantity: purchaseData.quantity,
-          unit_price: purchaseData.unit_price,
-          total_price: purchaseData.total_price,
-          address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
-          city: purchaseData.city,
-          state: purchaseData.state,
-          postal_code: purchaseData.postal_code,
-          country: purchaseData.country,
-          phone_number: purchaseData.phone_number,
-          notes: purchaseData.notes,
-          pickup_clinic_id: purchaseData.pickup_clinic_id || null,
-          pickup_tracking_status: 'order_successful',
-          status: 'processing',
-          tracking_number: MerchantTxnId
-        });
-
-        // Reduce book stock
-        await book.update({
-          stock: book.stock - purchaseData.quantity
-        });
-
-        console.log('Purchase created successfully after payment success for order:', MerchantTxnId);
-      } else {
-        console.log('Purchase already exists for order:', MerchantTxnId);
+      try {
+        await fulfillBookPayment(payment, { trackingNumber: MerchantTxnId });
+        console.log('Book payment fulfilled for order:', MerchantTxnId);
+      } catch (fulfillError) {
+        console.error('Fulfill book payment error:', fulfillError.message);
       }
     } else if (paymentStatus === 'FAILED') {
-      console.log('Payment failed for order:', MerchantTxnId, '- No purchase record created');
+      console.log('Payment failed for order:', MerchantTxnId);
     }
 
     // Return success response to gateway
@@ -1307,62 +1673,44 @@ const esewaSuccessCallback = async (req, res) => {
       });
     }
 
-    // Create purchase if not exists
-    let purchase = await PurchaseBook.findOne({ where: { tracking_number: transaction_uuid } });
-    if (!purchase) {
-      const purchaseData = gatewayResponseData.purchase_data;
-      if (!purchaseData) {
-        return res.status(400).json({ success: false, message: 'Purchase data not found in payment record' });
-      }
-
-      const book = await Book.findByPk(purchaseData.book_id);
-      if (!book) return res.status(404).json({ success: false, message: 'Book not found' });
-      if (!book.is_active) return res.status(400).json({ success: false, message: 'Book is not available for purchase' });
-      if (book.stock < purchaseData.quantity) {
-        return res.status(400).json({ success: false, message: `Insufficient stock. Only ${book.stock} available.` });
-      }
-
-      purchase = await PurchaseBook.create({
-        payment_id: payment.id,
-        user_id: purchaseData.user_id,
-        book_id: purchaseData.book_id,
-        quantity: purchaseData.quantity,
-        unit_price: purchaseData.unit_price,
-        total_price: purchaseData.total_price,
-        address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
-        city: purchaseData.city,
-        state: purchaseData.state,
-        postal_code: purchaseData.postal_code,
-        country: purchaseData.country,
-        phone_number: purchaseData.phone_number,
-        notes: purchaseData.notes,
-        pickup_clinic_id: purchaseData.pickup_clinic_id || null,
-        pickup_tracking_status: 'order_successful',
-        status: 'processing',
-        tracking_number: transaction_uuid
+    let purchase;
+    try {
+      purchase = await fulfillBookPayment(payment, { trackingNumber: transaction_uuid });
+    } catch (fulfillError) {
+      return res.status(400).json({
+        success: false,
+        message: fulfillError.message || 'Could not confirm payment',
+        data: { order_id: transaction_uuid }
       });
-
-      await book.update({ stock: book.stock - purchaseData.quantity });
     }
+
+    const purchasePhase = gatewayResponseData.purchase_data?.payment_phase || 'pre_booking';
+    const successMessage =
+      purchasePhase === 'balance'
+        ? 'Balance payment complete. Your order is confirmed for clinic pickup.'
+        : 'Pre-booking payment complete. Pay the remaining NPR 900 when the book is available for pickup.';
 
     return res.status(200).json({
       success: true,
-      message: 'eSewa payment complete. Purchase created/confirmed.',
+      message: successMessage,
       data: {
         order_id: transaction_uuid,
+        payment_phase: purchasePhase,
         purchase: withPickupLabels(
           await PurchaseBook.findByPk(purchase.id, {
             include: [
               {
                 model: Book,
                 as: 'book',
-                attributes: ['id', 'title', 'author', 'price', 'image_url']
+                attributes: ['id', 'title', 'author', 'price', 'image_url', 'balance_payment_enabled']
               },
               {
                 model: PickupClinic,
                 as: 'pickup_clinic',
                 attributes: CLINIC_CARD_ATTRIBUTES
-              }
+              },
+              { model: Payment, as: 'payment', attributes: ['id', 'order_id', 'status', 'amount'] },
+              { model: Payment, as: 'balance_payment', attributes: ['id', 'order_id', 'status', 'amount'] }
             ]
           })
         )
@@ -1496,43 +1844,29 @@ const checkPaymentStatus = async (req, res) => {
       updated_at: new Date()
     });
 
-    // If payment is successful and purchase doesn't exist yet, create it
-    if (paymentStatus === 'SUCCESS' && !purchase) {
-      const purchaseData = gatewayResponseData.purchase_data;
-      
-      if (purchaseData && purchaseData.user_id === userId) {
-        // Verify book still exists and is available
-        const book = await Book.findByPk(purchaseData.book_id);
-        if (book && book.is_active && book.stock >= purchaseData.quantity) {
-          // Create purchase record and link to payment
-          purchase = await PurchaseBook.create({
-            payment_id: payment.id,
-            user_id: purchaseData.user_id,
-            book_id: purchaseData.book_id,
-            quantity: purchaseData.quantity,
-            unit_price: purchaseData.unit_price,
-            total_price: purchaseData.total_price,
-            address: purchaseData.address || BOOK_CLINIC_PICKUP_ADDRESS_LINE,
-            city: purchaseData.city,
-            state: purchaseData.state,
-            postal_code: purchaseData.postal_code,
-            country: purchaseData.country,
-            phone_number: purchaseData.phone_number,
-            notes: purchaseData.notes,
-            pickup_clinic_id: purchaseData.pickup_clinic_id || null,
-            pickup_tracking_status: 'order_successful',
-            status: 'processing',
-            tracking_number: orderId
-          });
+    const purchaseData = gatewayResponseData.purchase_data;
+    const isBalancePayment = purchaseData?.payment_phase === 'balance';
 
-          // Reduce book stock
-          await book.update({
-            stock: book.stock - purchaseData.quantity
-          });
-
-          console.log('Purchase created after status check for order:', orderId);
+    if (paymentStatus === 'SUCCESS') {
+      if (isBalancePayment && purchaseData?.purchase_id) {
+        if (purchaseData.user_id === userId) {
+          try {
+            purchase = await fulfillBookPayment(payment);
+          } catch (e) {
+            console.error('Balance fulfill error:', e.message);
+          }
+        }
+      } else if (!purchase && purchaseData?.user_id === userId) {
+        try {
+          purchase = await fulfillBookPayment(payment, { trackingNumber: orderId });
+        } catch (e) {
+          console.error('Pre-booking fulfill error:', e.message);
         }
       }
+    } else if (isBalancePayment && purchaseData?.purchase_id && !purchase) {
+      purchase = await PurchaseBook.findOne({
+        where: { id: purchaseData.purchase_id, user_id: userId }
+      });
     }
 
     // Fetch purchase with book details if it exists
@@ -1749,6 +2083,14 @@ const updatePurchasePickupStatus = async (req, res) => {
       });
     }
 
+    if (!['processing', 'completed'].includes(purchase.status)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Pickup tracking can only be updated after the full balance is paid (order status must be processing or completed).'
+      });
+    }
+
     await purchase.update({ pickup_tracking_status });
 
     const updated = await PurchaseBook.findByPk(purchaseId, {
@@ -1789,6 +2131,8 @@ module.exports = {
   updateAddress,
   deleteAddress,
   purchaseBook,
+  payBookBalance,
+  setBookBalancePaymentEnabled,
   getMyOrders,
   getPurchaseHistory,
   getPurchaseById,
